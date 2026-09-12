@@ -24,6 +24,47 @@ function requestedChoice(req) {
   }
 }
 
+function effectiveRequestOrigin(req) {
+  const forwardedProtocol = String(
+    req.headers?.['x-forwarded-proto'] || '',
+  ).trim();
+  const protocol = req.socket?.encrypted
+    ? 'https:'
+    : forwardedProtocol === 'http' || forwardedProtocol === 'https'
+      ? `${forwardedProtocol}:`
+      : forwardedProtocol
+        ? null
+        : 'http:';
+  const host = String(req.headers?.host || '').trim();
+  if (!protocol || !host || /[\s/?#@]/.test(host)) return null;
+  try {
+    const parsed = new URL(`${protocol}//${host}`);
+    return parsed.host === host.toLowerCase() ? parsed.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+function allowsRequestOrigin(req) {
+  const origin = req.headers?.origin;
+  if (origin === undefined || origin === null || origin === '') return true;
+  const effectiveOrigin = effectiveRequestOrigin(req);
+  if (!effectiveOrigin) return false;
+  try {
+    const parsed = new URL(String(origin));
+    return (
+      parsed.username === '' &&
+      parsed.password === '' &&
+      parsed.pathname === '/' &&
+      parsed.search === '' &&
+      parsed.hash === '' &&
+      parsed.origin === effectiveOrigin
+    );
+  } catch {
+    return false;
+  }
+}
+
 function resolvedGeminiModel(value) {
   const selection = resolveVoiceModelChoice('gemini', value);
   return {
@@ -45,6 +86,10 @@ function createGeminiLiveTokenHandler({
       json(res, 405, { error: 'Method not allowed' });
       return;
     }
+    if (!allowsRequestOrigin(req)) {
+      json(res, 403, { error: 'Cross-origin requests are refused' });
+      return;
+    }
     if (!enforceOptInRateLimit(limiter, req, res)) return;
 
     const apiKey = process.env.GEMINI_API_KEY;
@@ -62,7 +107,7 @@ function createGeminiLiveTokenHandler({
         now + GEMINI_NEW_SESSION_WINDOW_MS,
       ).toISOString(),
       liveConnectConstraints: {
-        model,
+        model: `models/${model}`,
         config: {
           responseModalities: ['AUDIO'],
           systemInstruction: {

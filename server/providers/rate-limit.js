@@ -10,7 +10,10 @@ function enforceOptInRateLimit(limiter, req, res) {
 }
 
 function geminiRateLimiter() {
-  return makeOptInRateLimiter(process.env.GEV_RATELIMIT_GEMINI_PER_MIN || '10');
+  const configured = Number(process.env.GEV_RATELIMIT_GEMINI_PER_MIN);
+  const perMinute =
+    Number.isFinite(configured) && configured > 0 ? configured : 10;
+  return makeOptInRateLimiter(String(perMinute));
 }
 
 export { enforceOptInRateLimit, geminiRateLimiter };

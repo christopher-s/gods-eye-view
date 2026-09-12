@@ -41,6 +41,7 @@ function request(
     url = '/',
     body = '',
     origin = 'http://localhost:4173',
+    headers: requestHeaders = {},
   } = {},
 ) {
   return new Promise((resolve, reject) => {
@@ -50,8 +51,9 @@ function request(
       url,
       headers: {
         host: 'localhost:4173',
-        origin,
+        ...(origin === undefined ? {} : { origin }),
         'content-type': 'application/json',
+        ...requestHeaders,
       },
       socket: { remoteAddress: '127.0.0.1' },
     });
@@ -282,7 +284,7 @@ test('Gemini token handler allowlists choices, applies env overrides, and mints 
       'fixture-permanent-gemini-key',
     );
     assert.equal(call.payload.uses, 1);
-    assert.equal(call.payload.liveConnectConstraints.model, model);
+    assert.equal(call.payload.liveConnectConstraints.model, `models/${model}`);
     assert.deepEqual(
       call.payload.liveConnectConstraints.config.responseModalities,
       ['AUDIO'],
@@ -302,6 +304,88 @@ test('Gemini token handler allowlists choices, applies env overrides, and mints 
     assert.ok(
       sessionExpiry > Date.now() && sessionExpiry <= Date.now() + 2 * 60_000,
     );
+  }
+});
+
+test('Gemini token handler rejects hostile browser origins before rate limiting or upstream work while allowing same-origin and origin-less clients', async (t) => {
+  env(t, 'GEMINI_API_KEY', 'fixture-permanent-gemini-key');
+  env(t, 'GEV_RATELIMIT_GEMINI_PER_MIN', '1');
+  let calls = 0;
+  const handler = createGeminiLiveTokenHandler({
+    fetchImpl: async () => {
+      calls++;
+      return Response.json({ name: 'authTokens/fixture-ephemeral-token' });
+    },
+  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const hostile = await request(handler, {
+      method: 'POST',
+      origin: 'https://attacker.example',
+    });
+    assert.equal(hostile.status, 403);
+    assert.deepEqual(hostile.json(), {
+      error: 'Cross-origin requests are refused',
+    });
+  }
+  assert.equal(calls, 0);
+  assert.equal((await request(handler, { method: 'POST' })).status, 200);
+  assert.equal(calls, 1);
+
+  const originlessHandler = createGeminiLiveTokenHandler({
+    fetchImpl: async () =>
+      Response.json({ name: 'authTokens/fixture-cli-token' }),
+  });
+  assert.equal(
+    (await request(originlessHandler, { method: 'POST', origin: undefined }))
+      .status,
+    200,
+  );
+});
+
+test('Gemini token handler derives its exact same origin from Host and a valid forwarded protocol', async (t) => {
+  env(t, 'GEMINI_API_KEY', 'fixture-permanent-gemini-key');
+  env(t, 'GEV_RATELIMIT_GEMINI_PER_MIN', '10');
+  const handler = createGeminiLiveTokenHandler({
+    fetchImpl: async () =>
+      Response.json({ name: 'authTokens/fixture-ephemeral-token' }),
+  });
+  assert.equal(
+    (
+      await request(handler, {
+        method: 'POST',
+        origin: 'https://localhost:4173',
+        headers: { 'x-forwarded-proto': 'https' },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request(handler, {
+        method: 'POST',
+        origin: 'https://localhost:4173',
+        headers: { 'x-forwarded-proto': 'https, http' },
+      })
+    ).status,
+    403,
+  );
+});
+
+test('Gemini rate limiting defaults to 10/minute for missing, zero, negative, and malformed values', async (t) => {
+  env(t, 'GEMINI_API_KEY', 'fixture-permanent-gemini-key');
+  for (const value of [undefined, '0', '-1', 'garbage']) {
+    env(t, 'GEV_RATELIMIT_GEMINI_PER_MIN', value);
+    let calls = 0;
+    const handler = createGeminiLiveTokenHandler({
+      fetchImpl: async () => {
+        calls++;
+        return Response.json({ name: 'authTokens/fixture-ephemeral-token' });
+      },
+    });
+    for (let attempt = 0; attempt < 10; attempt++)
+      assert.equal((await request(handler, { method: 'POST' })).status, 200);
+    assert.equal((await request(handler, { method: 'POST' })).status, 429);
+    assert.equal(calls, 10);
   }
 });
 
