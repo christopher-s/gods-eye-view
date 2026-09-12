@@ -3147,6 +3147,359 @@ const fnCallEvent = (name, itemId, callId) => ({
   }),
 });
 
+// ---------------------------------------------------------------------------
+// Provider routing at start() — Gemini Live vs OpenAI Realtime
+// ---------------------------------------------------------------------------
+
+/**
+ * Controller + fake Gemini transport factory. Captures the callbacks the
+ * controller wires into the transport so tests can drive the REAL handlers.
+ */
+function geminiControllerHarness({ runner } = {}) {
+  const toolCalls = [];
+  const radio = [];
+  const microphone = { enabled: false, stop() {} };
+  const mediaStream = {
+    id: 'gemini-mic',
+    getAudioTracks: () => [microphone],
+    getTracks: () => [microphone],
+  };
+  const ui = {
+    root: {
+      dataset: {},
+      classList: { remove() {}, add() {} },
+      querySelectorAll: () => [],
+      remove() {},
+    },
+    status: { textContent: '' },
+    detail: { textContent: '', title: '' },
+    errorDetail: { textContent: '' },
+    button: { dataset: {}, addEventListener() {}, removeEventListener() {} },
+    buttonLabel: { textContent: '' },
+    tierButton: null,
+    costValue: { textContent: '', title: '', dataset: {} },
+  };
+  const controller = new GevRealtimeController({
+    ui,
+    runner:
+      runner ||
+      (async (name) => {
+        toolCalls.push(name);
+        return { ok: true };
+      }),
+    radioLayer: {
+      pause: () => radio.push('pause'),
+      setVoiceDucked: (ducked) => radio.push(ducked ? 'duck' : 'unduck'),
+    },
+  });
+  controller.debugLog = () => {};
+  controller.updateVoiceButtonLabel = () => {};
+
+  const transports = [];
+  let capturedCallbacks = null;
+  controller.createGeminiTransport = (callbacks) => {
+    capturedCallbacks = callbacks;
+    const transport = {
+      readyState: 'idle',
+      servedModel: 'gemini-2.5-flash-native-audio-preview-12-2025',
+      sentText: [],
+      sentImages: [],
+      toolResponses: [],
+      stopCalls: 0,
+      async start(options) {
+        this.startOptions = options;
+        this.readyState = 'open';
+      },
+      sendText(text, sendOptions) {
+        this.sentText.push({ text, ...sendOptions });
+        return true;
+      },
+      sendImage(part) {
+        this.sentImages.push(part);
+        return true;
+      },
+      sendToolResponse(responses) {
+        this.toolResponses.push(responses);
+        return true;
+      },
+      stop() {
+        this.stopCalls += 1;
+        this.readyState = 'closed';
+      },
+    };
+    transports.push(transport);
+    return transport;
+  };
+
+  return {
+    controller,
+    ui,
+    toolCalls,
+    radio,
+    microphone,
+    mediaStream,
+    transports,
+    getTransport: () => transports.at(-1),
+    getCallbacks: () => capturedCallbacks,
+    installGlobals(t) {
+      const saved = {};
+      const stash = (name, value) => {
+        saved[name] = Object.getOwnPropertyDescriptor(globalThis, name);
+        Object.defineProperty(globalThis, name, {
+          value,
+          configurable: true,
+          writable: true,
+        });
+      };
+      stash('window', { __GOOGLE_MAPS_API_KEY__: 'test-key' });
+      stash('navigator', {
+        mediaDevices: { getUserMedia: async () => mediaStream },
+      });
+      stash('fetch', async () => {
+        throw new Error('unexpected network call');
+      });
+      t.after(() => {
+        for (const [name, descriptor] of Object.entries(saved)) {
+          if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+          else delete globalThis[name];
+        }
+        controller.stop({ removeUi: true });
+      });
+    },
+  };
+}
+
+test('start() selects the Gemini transport when the pending provider is gemini', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+
+  await f.controller.start();
+
+  const transport = f.getTransport();
+  assert.equal(f.transports.length, 1, 'exactly one Gemini transport');
+  assert.ok(transport, 'transport created');
+  assert.equal(transport.startOptions.modelChoice, 'gemini-2.5');
+  assert.equal(
+    transport.startOptions.mediaStream,
+    f.mediaStream,
+    'mic stream routed into the transport',
+  );
+  assert.equal(f.controller.voiceTransport, transport);
+  assert.equal(f.controller.status, 'listening');
+  assert.equal(f.controller.costTracker.state().costAvailable, false);
+  assert.equal(
+    f.controller.costTracker.state().modelId,
+    'gemini-2.5-flash-native-audio-preview-12-2025',
+  );
+});
+
+test('start() keeps the OpenAI Realtime path when the pending provider is openai', async (t) => {
+  const f = geminiControllerHarness();
+  const savedFetch = globalThis.fetch;
+  const savedWindow = globalThis.window;
+  globalThis.window = {
+    RTCPeerConnection: class {},
+    __GOOGLE_MAPS_API_KEY__: 'test-key',
+  };
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 500,
+    json: async () => ({}),
+    headers: { get: () => null },
+  });
+  t.after(() => {
+    globalThis.window = savedWindow;
+    globalThis.fetch = savedFetch;
+    f.controller.stop({ removeUi: true });
+  });
+  f.controller.setVoiceProvider('openai');
+  await f.controller.start();
+
+  assert.equal(
+    f.transports.length,
+    0,
+    'no Gemini transport on the OpenAI path',
+  );
+  assert.equal(f.controller.voiceTransport, null);
+});
+
+test('stop() tears down the active Gemini transport exactly once', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+
+  f.controller.stop();
+  f.controller.stop({ removeUi: true });
+
+  assert.equal(
+    f.getTransport().stopCalls,
+    1,
+    'idempotent across double stop()',
+  );
+  assert.equal(f.controller.voiceTransport, null);
+});
+
+test('a fatal Gemini transport error routes into the controller error path', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+
+  f.getCallbacks().onError(new Error('connection lost'), {
+    fatal: true,
+    code: 1006,
+  });
+
+  assert.equal(f.controller.status, 'error');
+  assert.equal(f.controller.errors[0].source, 'Gemini Live');
+  assert.equal(f.controller.voiceTransport, null);
+  assert.equal(f.getTransport().stopCalls, 1);
+});
+
+test('Gemini interruptions mark a user turn, cancel the radio handoff, and duck Radio', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+  f.radio.length = 0;
+
+  f.controller.setRadioVoiceDucking(false); // unlatch the connect-time duck
+  f.getCallbacks().onInterrupted();
+
+  assert.equal(f.controller.userTurnPending, true);
+  assert.equal(f.controller.ui.root.dataset.speaker, 'user');
+  assert.ok(f.radio.includes('pause'), JSON.stringify(f.radio));
+  assert.ok(f.radio.includes('duck'), JSON.stringify(f.radio));
+});
+
+test('Gemini assistant turns drive the speaker state and reset the user-turn marker', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+  f.getCallbacks().onInterrupted();
+  assert.equal(f.controller.userTurnPending, true);
+
+  f.getCallbacks().onAssistantTurnStart();
+  assert.equal(f.controller.ui.root.dataset.speaker, 'ai');
+  assert.equal(f.controller.userTurnPending, false);
+
+  f.getCallbacks().onTurnComplete();
+  assert.equal(f.controller.ui.root.dataset.speaker, 'idle');
+  assert.equal(f.controller.responseActive, false);
+});
+
+test('Gemini tool results stage the radio handoff and complete it on turn completion', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  let handoffStarted = false;
+  await f.controller.start();
+  f.controller.startPendingRadioHandoff = async () => {
+    handoffStarted = true;
+  };
+
+  f.getCallbacks().onToolResult({
+    ok: true,
+    action: 'control_radio',
+    radioAction: 'play',
+    radioPlaybackRequested: true,
+  });
+  assert.ok(f.controller.pendingRadioPlaybackResult, 'playback result staged');
+
+  f.getCallbacks().onTurnComplete();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(handoffStarted, true, 'handoff starts when the turn completes');
+});
+
+test('a Gemini radio playback handoff stops voice after the tool responses are sent', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+
+  // A completed play that does not need a handoff (Radio already playing)
+  // releases the speaker, mirroring shouldStopVoiceAfterRadioTool.
+  f.getCallbacks().onAfterToolResponses([
+    { ok: true, action: 'control_radio', radioAction: 'play' },
+  ]);
+  assert.equal(f.controller.status, 'idle');
+  assert.equal(f.controller.voiceTransport, null);
+  assert.equal(f.getTransport().stopCalls, 1);
+});
+
+test('Gemini usage metadata is recorded without dollar claims or a cap', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+
+  f.getCallbacks().onUsage({
+    inputTokenCount: 10,
+    outputTokenCount: 20,
+    totalTokenCount: 30,
+  });
+
+  const state = f.controller.costTracker.state();
+  assert.equal(state.responses, 1);
+  assert.equal(state.totalUsd, 0);
+  assert.equal(state.capReached, false);
+  assert.equal(state.usage.totalTokenCount, 30);
+  assert.equal(f.controller.isSessionEnding(), false);
+});
+
+test('sendTextCommand routes through the Gemini transport and marks a user turn', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+
+  f.controller.sendTextCommand('fly to Tokyo');
+  const transport = f.getTransport();
+
+  assert.deepEqual(transport.sentText, [{ text: 'fly to Tokyo' }]);
+  assert.equal(f.controller.userTurnPending, true);
+});
+
+test('sendTextCommand still throws when no voice session is connected', () => {
+  const f = geminiControllerHarness();
+  assert.throws(() => f.controller.sendTextCommand('hello'), /not connected/);
+});
+
+test('annotation notifications reach the Gemini transport as non-completing context', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+
+  const sent = f.controller.notifyMapEvent({
+    type: 'map_annotation_outline',
+    ok: true,
+  });
+  const transport = f.getTransport();
+  assert.equal(sent, true);
+  assert.equal(transport.sentText.length, 1);
+  assert.equal(transport.sentText[0].turnComplete, false);
+  assert.equal(
+    JSON.parse(transport.sentText[0].text).type,
+    'map_annotation_outline',
+  );
+});
+
+test('Gemini cost is unavailable in diagnostics while OpenAI rates stay untouched', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+
+  const diagnostics = f.controller.getDiagnostics();
+  assert.equal(diagnostics.cost.costAvailable, false);
+  assert.equal(diagnostics.cost.totalUsd, 0);
+  assert.equal(diagnostics.provider, 'gemini');
+});
+
 test('provider and model mutations update pending selection without rebinding a live session', () => {
   const { controller } = costControllerHarness();
   controller.status = 'listening';

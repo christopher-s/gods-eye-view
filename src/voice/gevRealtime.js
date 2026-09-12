@@ -14,6 +14,10 @@ import {
   resolveVoiceProvider,
   writeStoredVoiceSelection,
 } from './voiceProviders.js';
+import {
+  createGeminiVoiceCostTracker,
+  GeminiLiveTransport,
+} from './geminiLiveTransport.js';
 
 const TOKEN_URL = '/api/realtime/token';
 const REALTIME_CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
@@ -274,6 +278,12 @@ export class GevRealtimeController {
     this.buttonHandler = null;
     this.tierHandler = null;
     this.annotationEventUnsubscribe = null;
+    // Active Gemini Live transport (null while idle / on OpenAI). The OpenAI
+    // path keeps its pc/dc fields; Gemini owns everything behind this handle.
+    this.voiceTransport = null;
+    // Injectable factory so tests (and only tests) can substitute transports.
+    // Bound so the default factory closes over this controller.
+    this.createGeminiTransport = createGeminiLiveTransport.bind(this);
     // Voice cost control. The tier is chosen BEFORE a session starts and is
     // baked into the minted token, so a live session always keeps the model it
     // connected with — the toggle is labelled "applies next session" for that
@@ -356,10 +366,6 @@ export class GevRealtimeController {
     this.pushToTalkMode = pushToTalk;
     this.pushToTalkKeyHeld = pushToTalkKeyHeld;
     this.spaceKeyHeld = spaceKeyHeld;
-    if (!window.RTCPeerConnection || !navigator.mediaDevices?.getUserMedia) {
-      this.setStatus('error', 'WebRTC microphone support unavailable');
-      return;
-    }
 
     // Claim this connect attempt. stop() (and any later start()) bump startEpoch,
     // so `epoch !== this.startEpoch` after any await means we were superseded and
@@ -376,6 +382,17 @@ export class GevRealtimeController {
     }
     this.voiceLimits = readStoredVoiceLimits();
     this.costCapStopped = false;
+
+    if (this.voiceSelection.provider === 'gemini') {
+      await this.startGeminiSession(epoch, { pushToTalkKeyHeld });
+      return;
+    }
+
+    if (!window.RTCPeerConnection || !navigator.mediaDevices?.getUserMedia) {
+      this.setStatus('error', 'WebRTC microphone support unavailable');
+      return;
+    }
+
     // Provisional meter (tier-priced) so the readout shows $0.00 while
     // connecting. It is REPLACED below with one bound to the model the server
     // actually served, before any usage can arrive.
@@ -527,6 +544,204 @@ export class GevRealtimeController {
       this.stop({ preserveStatus: true });
       this.reportError('Realtime connection', error, diagnostics);
     }
+  }
+
+  /**
+   * Gemini Live session path, split out of start(). Mirrors the OpenAI flow:
+   * capability gate → meter → connecting status → mic → transport start →
+   * listening status. Uses the same startEpoch so stop()/restart supersede a
+   * mid-connect attempt identically (H7).
+   */
+  async startGeminiSession(epoch, { pushToTalkKeyHeld }) {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      this.setStatus('error', 'Microphone support unavailable');
+      return;
+    }
+    if (typeof WebSocket === 'undefined') {
+      this.setStatus('error', 'WebSocket support unavailable');
+      return;
+    }
+    // Gemini dollars are unavailable by design (unverified Live pricing) —
+    // usage lands in diagnostics, the meter never claims a cost or trips a cap.
+    this.costTracker = createGeminiVoiceCostTracker({
+      modelId: this.voiceSelection.modelId,
+      limits: this.voiceLimits,
+    });
+    this.syncCostUi();
+    this.setStatus('connecting', 'Requesting microphone');
+    this.debugLog('session.starting', {
+      epoch,
+      provider: 'gemini',
+      choice: this.voiceSelection.choice,
+    });
+    let localStream = null;
+    let transport = null;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+      });
+      if (epoch !== this.startEpoch) {
+        releaseStartResources({ localStream });
+        return;
+      }
+      this.stream = localStream;
+      this.setMicrophoneEnabled(!this.pushToTalkMode || pushToTalkKeyHeld);
+      this.startVoiceVisualizer(localStream);
+
+      transport = this.createGeminiTransport(this.geminiTransportCallbacks(epoch));
+      this.voiceTransport = transport;
+      await transport.start({
+        modelChoice: this.voiceSelection.choice,
+        mediaStream: localStream,
+      });
+      if (epoch !== this.startEpoch) {
+        // Superseded mid-connect: stop() already tore down the promoted
+        // transport if it saw it; stop ours and release the mic.
+        if (this.voiceTransport === transport) this.voiceTransport = null;
+        try { transport.stop('superseded'); } catch { /* no-op */ }
+        releaseStartResources({ localStream });
+        if (this.stream === localStream) this.stream = null;
+        return;
+      }
+      // Bind the meter to the model the server actually resolved.
+      const servedModel = transport.servedModel || this.voiceSelection.modelId;
+      if (servedModel && servedModel !== this.voiceSelection.modelId) {
+        this.costTracker = createGeminiVoiceCostTracker({
+          modelId: servedModel,
+          limits: this.voiceLimits,
+        });
+        this.syncCostUi();
+      }
+      this.debugLog('gemini.session.started', {
+        epoch,
+        servedModel,
+        choice: this.voiceSelection.choice,
+      });
+      this.setStatus('listening', 'Ask or command');
+    } catch (error) {
+      if (epoch !== this.startEpoch) {
+        if (this.voiceTransport === transport) this.voiceTransport = null;
+        try { transport?.stop('superseded-error'); } catch { /* no-op */ }
+        releaseStartResources({ localStream });
+        if (this.stream === localStream) this.stream = null;
+        return;
+      }
+      if (this.voiceTransport === transport) this.voiceTransport = null;
+      try { transport?.stop('start-failed'); } catch { /* no-op */ }
+      this.stop({ preserveStatus: true });
+      this.reportError('Gemini Live', error, { provider: 'gemini' });
+    }
+  }
+
+  /**
+   * The normalized callback bundle wired into every Gemini transport. Each
+   * handler translates a provider-neutral transport event into the same
+   * controller state machine the OpenAI data-channel path drives.
+   */
+  geminiTransportCallbacks(epoch) {
+    return {
+      onState: (state) => {
+        this.debugLog('gemini.transport.state', { phase: state?.phase });
+      },
+      onInterrupted: () => {
+        this.userTurnPending = true;
+        this.pendingResponseInstructions = null;
+        this.cancelRadioHandoff({ abortTools: true });
+        this.setVoiceSpeaker('user');
+      },
+      onAssistantTurnStart: () => {
+        this.userTurnPending = false;
+        this.responseActive = true;
+        this.setVoiceSpeaker('ai');
+      },
+      onAssistantAudio: () => {
+        // Playback scheduling lives inside the transport's PCM session; the
+        // controller only owes the visualizer state above.
+      },
+      onTurnComplete: () => {
+        this.responseActive = false;
+        this.setVoiceSpeaker('idle', { keepVisualizerSpeaker: true });
+        if (this.pendingRadioPlaybackResult) {
+          void this.startPendingRadioHandoff();
+          return;
+        }
+        if (this.pendingUserTextResponse) this.pendingUserTextResponse = false;
+        this.flushPendingResponseGemini();
+      },
+      onUsage: (usage) => {
+        // Gemini tokens are diagnostics only — the tracker records the event
+        // without pricing it (no dollar claim, no cap enforcement).
+        this.recordUsage(usage);
+      },
+      onStatus: (status, detail) => {
+        if (status === 'executing' || status === 'listening') {
+          this.setStatus(status, detail);
+        }
+      },
+      onError: (error, info) => {
+        this.debugLog('gemini.transport.error', {
+          fatal: Boolean(info?.fatal),
+          code: info?.code ?? null,
+        });
+        this.stop({ preserveStatus: true });
+        this.reportError('Gemini Live', error, {
+          provider: 'gemini',
+          code: info?.code ?? null,
+          ...(info?.fatal ? { fatal: true } : {}),
+        });
+      },
+      onToolResult: (result) => {
+        this.debugLog('tool.result', { result });
+        if (result?.ok && result.radioPlaybackRequested) {
+          this.pendingRadioPlaybackResult = result;
+        } else if (
+          result?.ok
+          && result.action === 'control_radio'
+          && ['disable', 'pause', 'stop'].includes(result.radioAction)
+        ) {
+          this.cancelRadioHandoff();
+        }
+      },
+      onAfterToolResponses: (results) => {
+        const lastResult = results?.at(-1) || null;
+        if (
+          lastResult
+          && shouldStopVoiceAfterRadioTool(lastResult)
+          && !lastResult.radioPlaybackRequested
+          && !lastResult.radioPlaybackSuppressed
+        ) {
+          this.stop();
+          return;
+        }
+        this.flushPendingResponseGemini(
+          responseInstructionForToolResult(this.pendingRadioPlaybackResult || lastResult),
+        );
+      },
+      onLog: (event, payload) => {
+        this.debugLog(`gemini.${event}`, payload);
+      },
+      onAudioContext: () => {
+        // The transport owns its PCM AudioContext; the microphone visualizer
+        // keeps the controller-managed context started in startVoiceVisualizer.
+      },
+    };
+  }
+
+  /**
+   * Queue a spoken follow-up on the Gemini path. Gemini Live answers on its
+   * own once tool responses return; instructions ride the next turn's
+   * context, so we only retain them for diagnostics/radio wording.
+   */
+  flushPendingResponseGemini(instructions) {
+    this.pendingResponseInstructions = instructions || this.pendingResponseInstructions;
+    this.debugLog('gemini.followup.pending', {
+      instructions: this.pendingResponseInstructions || null,
+    });
   }
 
   // Returns true (and tears down the just-acquired resources) when this start()
@@ -896,6 +1111,13 @@ export class GevRealtimeController {
       this.pc = null;
     }
     this._tearingDown = false;
+    if (this.voiceTransport) {
+      // Gemini teardown goes through the transport (socket, PCM session,
+      // AudioContext). stop() re-enters nothing: the transport's callbacks
+      // report fatal errors only for UNEXPECTED closures, and ours is expected.
+      try { this.voiceTransport.stop('controller.stop'); } catch { /* no-op */ }
+      this.voiceTransport = null;
+    }
     if (this.stream) {
       this.stopVoiceVisualizer();
       this.stream.getTracks().forEach((track) => track.stop());
@@ -982,6 +1204,11 @@ export class GevRealtimeController {
    * injection hygiene as failedLabels), never instruction-bearing prose.
    */
   notifyMapEvent(payload) {
+    if (this.voiceTransport?.readyState === 'open') {
+      // Gemini has no item IDs: serialized JSON rides a non-completing user
+      // turn, keeping the same injection hygiene as the OpenAI system item.
+      return this.voiceTransport.sendText(JSON.stringify(payload), { turnComplete: false });
+    }
     if (!this.dc || this.dc.readyState !== 'open') return false;
     return this.sendRealtimeEvent({
       type: 'conversation.item.create',
@@ -994,12 +1221,20 @@ export class GevRealtimeController {
   }
 
   sendTextCommand(text) {
-    if (!this.dc || this.dc.readyState !== 'open') {
+    const onGemini = this.voiceTransport?.readyState === 'open';
+    if (!onGemini && (!this.dc || this.dc.readyState !== 'open')) {
       throw new Error('GEV voice is not connected');
     }
     const cleanText = String(text || '').trim();
     if (!cleanText) return;
     this.cancelRadioHandoff({ abortTools: true });
+    if (onGemini) {
+      // Gemini's turn model is push-to-talk: the completing user turn itself
+      // solicits the answer; superseding is handled through isCurrent().
+      this.userTurnPending = true;
+      this.voiceTransport.sendText(cleanText);
+      return;
+    }
     this.supersedeActiveResponseForUserTurn();
     const itemEvent = {
       type: 'conversation.item.create',
@@ -1793,6 +2028,7 @@ export class GevRealtimeController {
   getDiagnostics() {
     return {
       status: this.status,
+      provider: this.voiceSelection?.provider || 'openai',
       connection: this.connectionDiagnostics(),
       recentErrors: this.errors.slice(),
       debugLog: {
@@ -1868,10 +2104,17 @@ export class GevRealtimeController {
     if (this.ui?.costValue) {
       this.ui.costValue.textContent = state.display;
       this.ui.costValue.dataset.level = state.level;
-      this.ui.costValue.title =
-        `Estimated session cost on ${state.modelId} — ${state.responses} response(s). ` +
-        `Warns at ${formatCostUsd(state.warnUsd)}, ends the session at ${formatCostUsd(state.capUsd)}.`
-        + (state.note ? ` ${state.note}` : '');
+      if (state.costAvailable === false) {
+        // Gemini: no dollar claim, no thresholds implied.
+        this.ui.costValue.title =
+          `Session model ${state.modelId} — ${state.responses} response(s). `
+          + (state.note || '');
+      } else {
+        this.ui.costValue.title =
+          `Estimated session cost on ${state.modelId} — ${state.responses} response(s). ` +
+          `Warns at ${formatCostUsd(state.warnUsd)}, ends the session at ${formatCostUsd(state.capUsd)}.`
+          + (state.note ? ` ${state.note}` : '');
+      }
     }
   }
 
@@ -2123,6 +2366,25 @@ export class GevRealtimeController {
       payload: sanitizeDebugValue(payload),
     });
   }
+}
+
+/**
+ * Default Gemini transport factory (bound to the controller; see the
+ * constructor). `isCurrent` binds transport tool calls to THIS controller
+ * session: a call is current only while the transport is the live one and no
+ * newer user turn intervened.
+ */
+function createGeminiLiveTransport(callbacks) {
+  return new GeminiLiveTransport({
+    ...callbacks,
+    runner: (name, args, options) => this.runner(name, args, options),
+    isCurrent: () => (
+      this.voiceTransport !== null
+      && !this.userTurnPending
+      && this.status !== 'idle'
+      && this.status !== 'error'
+    ),
+  });
 }
 
 function shouldSendViewportImage(viewScale) {
