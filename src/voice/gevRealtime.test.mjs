@@ -3147,6 +3147,34 @@ const fnCallEvent = (name, itemId, callId) => ({
   }),
 });
 
+test('provider and model mutations update pending selection without rebinding a live session', () => {
+  const { controller } = costControllerHarness();
+  controller.status = 'listening';
+  controller.dc = { readyState: 'open', send() {}, close() {} };
+  controller.costTracker = createVoiceCostTracker({ modelId: 'gpt-realtime-2' });
+
+  controller.setVoiceProvider('gemini');
+  controller.setVoiceModelChoice('gemini-3');
+
+  assert.deepEqual(controller.voiceSelection, {
+    provider: 'gemini',
+    choice: 'gemini-3',
+    label: 'Gemini 3 Flash Live',
+    modelId: 'gemini-3.1-flash-live-preview',
+  });
+  assert.equal(controller.costTracker.state().modelId, 'gpt-realtime-2');
+});
+
+test('OpenAI tier compatibility helpers select OpenAI and preserve tier behavior', () => {
+  const { controller } = costControllerHarness();
+  controller.setVoiceTier('mini');
+  assert.equal(controller.voiceTier, 'mini');
+  assert.equal(controller.voiceSelection.provider, 'openai');
+  assert.equal(controller.voiceSelection.choice, 'mini');
+  assert.equal(controller.toggleVoiceTier(), 'standard');
+  assert.equal(controller.voiceSelection.choice, 'standard');
+});
+
 test('F1: toggling tier mid-session does not erase accrued spend', () => {
   const { controller } = costControllerHarness();
   controller.status = 'listening'; // live session

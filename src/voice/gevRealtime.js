@@ -9,6 +9,11 @@ import {
   resolveVoiceModel,
   serializeCostLimits,
 } from './voiceCost.js';
+import {
+  readStoredVoiceSelection,
+  resolveVoiceProvider,
+  writeStoredVoiceSelection,
+} from './voiceProviders.js';
 
 const TOKEN_URL = '/api/realtime/token';
 const REALTIME_CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
@@ -273,7 +278,10 @@ export class GevRealtimeController {
     // baked into the minted token, so a live session always keeps the model it
     // connected with — the toggle is labelled "applies next session" for that
     // reason. Limits are read once here and re-read at each start().
-    this.voiceTier = readStoredVoiceTier();
+    this.voiceSelection = readStoredVoiceSelection();
+    this.voiceTier = this.voiceSelection.provider === 'openai'
+      ? this.voiceSelection.choice
+      : readStoredVoiceTier();
     this.voiceLimits = readStoredVoiceLimits();
     this.costTracker = createVoiceCostTracker({
       tier: this.voiceTier,
@@ -360,7 +368,12 @@ export class GevRealtimeController {
     // A new session is a new meter. Re-read tier + limits so a toggle made
     // while the last session ran (or in another tab) takes effect exactly here
     // — this is what "applies next session" means.
-    this.voiceTier = readStoredVoiceTier();
+    this.voiceSelection = readStoredVoiceSelection();
+    if (this.voiceSelection.provider === 'openai') {
+      this.voiceTier = this.voiceSelection.choice;
+    } else {
+      this.voiceTier = readStoredVoiceTier();
+    }
     this.voiceLimits = readStoredVoiceLimits();
     this.costCapStopped = false;
     // Provisional meter (tier-priced) so the readout shows $0.00 while
@@ -1891,6 +1904,10 @@ export class GevRealtimeController {
    */
   setVoiceTier(tier) {
     this.voiceTier = writeStoredVoiceTier(tier);
+    this.voiceSelection = writeStoredVoiceSelection({
+      provider: 'openai',
+      choice: this.voiceTier,
+    });
     if (this.isVoiceSessionSettled()) {
       this.costTracker = createVoiceCostTracker({
         tier: this.voiceTier,
@@ -1902,6 +1919,37 @@ export class GevRealtimeController {
       this.setStatus(this.status, `${this.voiceTier.toUpperCase()} applies next session`);
     }
     return this.voiceTier;
+  }
+
+  /** Set the provider used by the next session, preserving its stored model choice. */
+  setVoiceProvider(provider) {
+    const resolvedProvider = resolveVoiceProvider(provider).provider;
+    this.voiceSelection = writeStoredVoiceSelection({ provider: resolvedProvider });
+    if (resolvedProvider === 'openai') this.voiceTier = this.voiceSelection.choice;
+    this.syncPendingVoiceSelection();
+    return this.voiceSelection.provider;
+  }
+
+  /** Set an approved model choice for the pending provider. */
+  setVoiceModelChoice(choice) {
+    const provider = this.voiceSelection?.provider || resolveVoiceProvider().provider;
+    this.voiceSelection = writeStoredVoiceSelection({ provider, choice });
+    if (provider === 'openai') this.voiceTier = this.voiceSelection.choice;
+    this.syncPendingVoiceSelection();
+    return this.voiceSelection.choice;
+  }
+
+  syncPendingVoiceSelection() {
+    if (this.isVoiceSessionSettled() && this.voiceSelection.provider === 'openai') {
+      this.costTracker = createVoiceCostTracker({
+        tier: this.voiceSelection.choice,
+        limits: this.voiceLimits,
+      });
+    }
+    this.syncCostUi();
+    if (this.isActive() && this.ui?.detail) {
+      this.setStatus(this.status, `${this.voiceSelection.label} applies next session`);
+    }
   }
 
   /**
