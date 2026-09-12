@@ -39,7 +39,12 @@ function effectiveRequestOrigin(req) {
   if (!protocol || !host || /[\s/?#@]/.test(host)) return null;
   try {
     const parsed = new URL(`${protocol}//${host}`);
-    return parsed.host === host.toLowerCase() ? parsed.origin : null;
+    const defaultPort = protocol === 'https:' ? ':443' : ':80';
+    const normalized = host.toLowerCase();
+    const authority = normalized.endsWith(defaultPort)
+      ? normalized.slice(0, -defaultPort.length)
+      : normalized;
+    return parsed.host === authority ? parsed.origin : null;
   } catch {
     return null;
   }

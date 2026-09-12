@@ -371,6 +371,55 @@ test('Gemini token handler derives its exact same origin from Host and a valid f
   );
 });
 
+test('Gemini token handler accepts Hosts with explicit default ports while requiring exact non-default port matches', async (t) => {
+  env(t, 'GEMINI_API_KEY', 'fixture-permanent-gemini-key');
+  env(t, 'GEV_RATELIMIT_GEMINI_PER_MIN', '10');
+  const handler = createGeminiLiveTokenHandler({
+    fetchImpl: async () =>
+      Response.json({ name: 'authTokens/fixture-ephemeral-token' }),
+  });
+  assert.equal(
+    (
+      await request(handler, {
+        method: 'POST',
+        origin: 'https://example.com',
+        headers: { host: 'example.com:443', 'x-forwarded-proto': 'https' },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request(handler, {
+        method: 'POST',
+        origin: 'http://example.com',
+        headers: { host: 'example.com:80' },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request(handler, {
+        method: 'POST',
+        origin: 'https://example.com:8443',
+        headers: { host: 'example.com:8443', 'x-forwarded-proto': 'https' },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request(handler, {
+        method: 'POST',
+        origin: 'https://example.com',
+        headers: { host: 'example.com:8443', 'x-forwarded-proto': 'https' },
+      })
+    ).status,
+    403,
+  );
+});
+
 test('Gemini rate limiting defaults to 10/minute for missing, zero, negative, and malformed values', async (t) => {
   env(t, 'GEMINI_API_KEY', 'fixture-permanent-gemini-key');
   for (const value of [undefined, '0', '-1', 'garbage']) {
