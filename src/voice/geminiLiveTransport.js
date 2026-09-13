@@ -28,6 +28,12 @@ export const GEMINI_LIVE_WEBSOCKET_ENDPOINT =
 
 const GEMINI_INPUT_MIME_TYPE = 'audio/pcm;rate=16000';
 
+// How long a processed function-call ID stays in the dedupe memory, and a
+// hard ceiling on that memory so a pathological stream of distinct calls
+// cannot grow it without bound (mirrors the controller's CALL_DEDUPE_MS).
+const GEMINI_CALL_DEDUPE_MS = 2500;
+const GEMINI_CALL_DEDUPE_MEMORY_MAX = 64;
+
 function defaultFetch() {
   if (typeof fetch !== 'function') {
     throw new Error('Gemini Live requires fetch support');
@@ -214,13 +220,13 @@ export function createGeminiVoiceCostTracker(options = {}) {
  *
  * - `onState({phase})` — 'connecting' | 'open' | 'closed'
  * - `onInterrupted()` — user barge-in / interruption
- * - `onAssistantTurnStart()` — assistant audio turn began
+ * - `onAssistantTurnStart()` — first model output of a turn (any part/tool call)
  * - `onAssistantAudio(base64Chunk)` — one 24 kHz PCM chunk for playback
  * - `onTurnComplete()` — assistant turn finished
  * - `onUsage(usageMetadata)` — usage telemetry, untouched
  * - `onStatus(status, detail)` — controller status mapping
  * - `onError(error, info)` — fatal transport errors ({fatal: true, ...})
- * - `onToolResult(result)` — final result of each dispatched tool call
+ * - `onToolResult(result)` — final result of each call (awaited before response)
  * - `onAfterToolResponses(results)` — after a toolResponse was sent
  * - `onLog(event, payload)` — diagnostics; never token-bearing
  * - `onAudioContext(context)` — the session's AudioContext, for visualizers
@@ -236,9 +242,10 @@ export class GeminiLiveTransport {
   #session = null;
   #servedModel = null;
   #assistantTurnActive = false;
-  #processedCalls = new Set();
+  #processedCalls = new Map();
   #activeToolControllers = new Set();
   #openSettled = null;
+  #earlyFatalError = null;
 
   constructor(options = {}) {
     if (typeof options.runner !== 'function') {
@@ -311,6 +318,7 @@ export class GeminiLiveTransport {
         modelChoice,
         this.#options.fetchImpl,
       );
+      this.#rejectIfFinalized();
       this.#servedModel =
         minted.model ||
         resolveVoiceModelChoice('gemini', minted.choice).modelId;
@@ -321,6 +329,7 @@ export class GeminiLiveTransport {
 
       this.#openSocket(minted.token);
       await this.#openSettled.promise;
+      this.#rejectIfFinalized();
 
       // The first message on a Gemini Live socket is always setup. The
       // constrained ephemeral token already binds system instructions, tools,
@@ -343,6 +352,7 @@ export class GeminiLiveTransport {
         );
       }
       await audioContext.audioWorklet.addModule(PCM_CAPTURE_MODULE_URL);
+      this.#rejectIfFinalized();
       this.#log('gemini.audio.module_loaded', {
         moduleUrl: PCM_CAPTURE_MODULE_URL,
       });
@@ -352,6 +362,7 @@ export class GeminiLiveTransport {
         (chunk) => this.#sendMicChunk(chunk),
         mediaStream,
       );
+      this.#rejectIfFinalized();
 
       this.#setState('open', 'Gemini Live session open');
       this.#log('gemini.session.open', { model: this.#servedModel });
@@ -444,12 +455,19 @@ export class GeminiLiveTransport {
     if (!this.#isOpen()) return false;
     const cleanText = String(text ?? '');
     if (!cleanText.trim()) return false;
-    return this.#sendJson({
+    const sent = this.#sendJson({
       clientContent: {
         turns: [{ role: 'user', content: [{ text: cleanText }] }],
         turnComplete,
       },
     });
+    if (sent && turnComplete) {
+      // A completing user turn supersedes any assistant turn that was still
+      // marked active locally (e.g. typed input or barge-in before turnComplete).
+      // The first output of the new turn must emit a fresh start edge.
+      this.#assistantTurnActive = false;
+    }
+    return sent;
   }
 
   /**
@@ -489,7 +507,12 @@ export class GeminiLiveTransport {
   }
 
   #handleMessage(event) {
-    if (!this.#isOpen()) return;
+    // The server can speak before start() has promoted the session to 'open'
+    // (e.g. a setup rejection racing our own audio wiring). Messages in that
+    // window are accepted once the socket itself is open — dropping them
+    // would lose the only copy of the failure reason.
+    const socketOpen = this.#socket?.readyState === 1;
+    if (!this.#isOpen() && !socketOpen) return;
     let payload = null;
     try {
       payload = JSON.parse(event?.data);
@@ -522,14 +545,15 @@ export class GeminiLiveTransport {
         this.#options.onInterrupted();
       }
       const parts = content.modelTurn?.parts;
-      if (Array.isArray(parts)) {
+      if (Array.isArray(parts) && parts.length) {
+        // ANY model output begins a turn: audio, text, or another part kind.
+        // A turn whose only output is a tool call has no modelTurn at all, so
+        // the turn-start edge for that case is reported in the toolCall
+        // branch below.
+        this.#beginAssistantTurn();
         for (const part of parts) {
           const data = part?.inlineData?.data;
           if (typeof data !== 'string' || !data) continue;
-          if (!this.#assistantTurnActive) {
-            this.#assistantTurnActive = true;
-            this.#options.onAssistantTurnStart();
-          }
           this.#session?.enqueueOutput?.(data);
           this.#options.onAssistantAudio(data);
         }
@@ -545,7 +569,31 @@ export class GeminiLiveTransport {
     }
 
     if (Array.isArray(payload.toolCall?.functionCalls)) {
+      // A tool call is itself model output: on a tool-only turn this is the
+      // first (and only) serverContent-free evidence that a turn began.
+      this.#beginAssistantTurn();
       void this.#dispatchToolCalls(payload.toolCall.functionCalls);
+    }
+  }
+
+  /** Report the turn-start edge once per turn, for any part kind. */
+  #beginAssistantTurn() {
+    if (this.#assistantTurnActive) return;
+    this.#assistantTurnActive = true;
+    this.#options.onAssistantTurnStart();
+  }
+
+  /**
+   * Bound the dedupe memory around each incoming event: entries older than the
+   * dedupe window expire and oldest entries are evicted past the hard ceiling.
+   */
+  #pruneProcessedCalls() {
+    const cutoff = this.#options.now() - GEMINI_CALL_DEDUPE_MS;
+    for (const [key, at] of this.#processedCalls) {
+      if (at < cutoff) this.#processedCalls.delete(key);
+    }
+    while (this.#processedCalls.size > GEMINI_CALL_DEDUPE_MEMORY_MAX) {
+      this.#processedCalls.delete(this.#processedCalls.keys().next().value);
     }
   }
 
@@ -576,12 +624,31 @@ export class GeminiLiveTransport {
   }
 
   #fatal(code, message) {
+    // Capture openness BEFORE the teardown below finalizes the state.
+    const wasOpen = this.#isOpen();
     this.#log('gemini.fatal', { code });
     this.#abortToolControllers();
     this.#teardownAudio();
     this.#closeSocketIntentionally('fatal');
     this.#finalize('closed');
-    this.#options.onError(new Error(message), { fatal: true, code });
+    const error = new Error(message);
+    if (wasOpen) {
+      this.#options.onError(error, { fatal: true, code });
+      return;
+    }
+    // Mid-start: the pending start() owns this failure — it rethrows the
+    // server's reason instead of surfacing one failure twice (rejection AND
+    // onError), mirroring the close-during-connect precedent.
+    this.#earlyFatalError = error;
+  }
+
+  /** Reject a start() still in flight when the session was torn down. */
+  #rejectIfFinalized() {
+    if (!this.#finalized) return;
+    throw (
+      this.#earlyFatalError ||
+      new Error('Gemini Live session closed before start completed')
+    );
   }
 
   #abortToolControllers() {
@@ -629,6 +696,12 @@ export class GeminiLiveTransport {
     this.#setState(phase, 'Gemini Live session closed');
   }
 
+  /** Abort in-flight tools while keeping the transport/session alive. */
+  abortTools(reason = 'superseded') {
+    this.#log('gemini.tools.abort', { reason });
+    this.#abortToolControllers();
+  }
+
   /** Idempotent full teardown of the session. */
   stop(reason = 'stopped') {
     this.#log('gemini.stop', { reason });
@@ -639,6 +712,7 @@ export class GeminiLiveTransport {
   }
 
   async #dispatchToolCalls(functionCalls) {
+    this.#pruneProcessedCalls();
     const entries = functionCalls.map((raw) => normalizeFunctionCall(raw));
     const responses = new Array(entries.length);
     const duplicates = new Array(entries.length).fill(false);
@@ -651,7 +725,7 @@ export class GeminiLiveTransport {
         duplicates[index] = true;
         return;
       }
-      this.#processedCalls.add(dedupeKey);
+      this.#processedCalls.set(dedupeKey, this.#options.now());
 
       if (!call.name) {
         responses[index] = {
@@ -689,6 +763,8 @@ export class GeminiLiveTransport {
         }),
       );
     });
+    // Retain only a bounded recent suffix after admitting this batch.
+    this.#pruneProcessedCalls();
 
     if (duplicates.every(Boolean)) {
       // Everything was a duplicate — nothing to answer.
@@ -755,7 +831,18 @@ export class GeminiLiveTransport {
       this.#activeToolControllers.delete(controller);
     }
     const finalResult = ensureTransportableResult(result, call.name);
-    this.#options.onToolResult(finalResult);
+    try {
+      // Controller hooks may attach provider context (e.g. Gemini inline image)
+      // that must reach the model before this call's toolResponse continues the
+      // turn. Await async hooks while keeping their failure non-fatal.
+      await this.#options.onToolResult(finalResult);
+    } catch (error) {
+      this.#log('gemini.tool.result_callback_failed', {
+        name: call.name,
+        callId: call.id,
+        error: error?.message || String(error),
+      });
+    }
     this.#log('gemini.tool.result', { name: call.name, callId: call.id });
     return { id: call.id, name: call.name, response: finalResult };
   }

@@ -3154,8 +3154,13 @@ const fnCallEvent = (name, itemId, callId) => ({
 /**
  * Controller + fake Gemini transport factory. Captures the callbacks the
  * controller wires into the transport so tests can drive the REAL handlers.
+ *
+ * `useRealTransport: true` swaps the fake factory for the controller's REAL
+ * bound factory with only the I/O edges faked (fetch / WebSocket / audio):
+ * the real callbacks, real runner, and real isCurrent predicate all run, and
+ * tests drive the real WebSocket fake directly.
  */
-function geminiControllerHarness({ runner } = {}) {
+function geminiControllerHarness({ runner, useRealTransport = false } = {}) {
   const toolCalls = [];
   const radio = [];
   const microphone = { enabled: false, stop() {} };
@@ -3190,46 +3195,63 @@ function geminiControllerHarness({ runner } = {}) {
     radioLayer: {
       pause: () => radio.push('pause'),
       setVoiceDucked: (ducked) => radio.push(ducked ? 'duck' : 'unduck'),
+      stopPlayback: (options) =>
+        radio.push(`stopPlayback:${options?.origin ?? 'unknown'}`),
     },
   });
   controller.debugLog = () => {};
   controller.updateVoiceButtonLabel = () => {};
 
   const transports = [];
-  let capturedCallbacks = null;
-  controller.createGeminiTransport = (callbacks) => {
-    capturedCallbacks = callbacks;
-    const transport = {
-      readyState: 'idle',
-      servedModel: 'gemini-2.5-flash-native-audio-preview-12-2025',
-      sentText: [],
-      sentImages: [],
-      toolResponses: [],
-      stopCalls: 0,
-      async start(options) {
-        this.startOptions = options;
-        this.readyState = 'open';
-      },
-      sendText(text, sendOptions) {
-        this.sentText.push({ text, ...sendOptions });
-        return true;
-      },
-      sendImage(part) {
-        this.sentImages.push(part);
-        return true;
-      },
-      sendToolResponse(responses) {
-        this.toolResponses.push(responses);
-        return true;
-      },
-      stop() {
-        this.stopCalls += 1;
-        this.readyState = 'closed';
-      },
+  const callbackBundles = [];
+  const realSockets = [];
+
+  if (useRealTransport) {
+    const realGeminiCallbacks = controller.geminiTransportCallbacks;
+    controller.geminiTransportCallbacks = (epoch) => {
+      const bundle = realGeminiCallbacks.call(controller, epoch);
+      callbackBundles.push(bundle);
+      return bundle;
     };
-    transports.push(transport);
-    return transport;
-  };
+  } else {
+    controller.createGeminiTransport = (callbacks) => {
+      callbackBundles.push(callbacks);
+      const transport = {
+        readyState: 'idle',
+        servedModel: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        sentText: [],
+        sentImages: [],
+        toolResponses: [],
+        stopCalls: 0,
+        abortToolCalls: [],
+        async start(options) {
+          this.startOptions = options;
+          this.readyState = 'open';
+        },
+        sendText(text, sendOptions) {
+          this.sentText.push({ text, ...sendOptions });
+          return true;
+        },
+        sendImage(part) {
+          this.sentImages.push(part);
+          return true;
+        },
+        sendToolResponse(responses) {
+          this.toolResponses.push(responses);
+          return true;
+        },
+        abortTools(reason) {
+          this.abortToolCalls.push(reason);
+        },
+        stop() {
+          this.stopCalls += 1;
+          this.readyState = 'closed';
+        },
+      };
+      transports.push(transport);
+      return transport;
+    };
+  }
 
   return {
     controller,
@@ -3239,8 +3261,11 @@ function geminiControllerHarness({ runner } = {}) {
     microphone,
     mediaStream,
     transports,
-    getTransport: () => transports.at(-1),
-    getCallbacks: () => capturedCallbacks,
+    realSockets,
+    callbackBundles,
+    getTransport: () =>
+      useRealTransport ? controller.voiceTransport : transports.at(-1),
+    getCallbacks: () => callbackBundles.at(-1),
     installGlobals(t) {
       const saved = {};
       const stash = (name, value) => {
@@ -3255,9 +3280,42 @@ function geminiControllerHarness({ runner } = {}) {
       stash('navigator', {
         mediaDevices: { getUserMedia: async () => mediaStream },
       });
-      stash('fetch', async () => {
-        throw new Error('unexpected network call');
-      });
+      if (useRealTransport) {
+        stash('fetch', async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            token: 'ephemeral-test-token',
+            model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+            choice: 'gemini-2.5',
+            provider: 'gemini',
+          }),
+          headers: { get: () => null },
+        }));
+        stash(
+          'WebSocket',
+          class extends SelfOpeningFakeWebSocket {
+            constructor(url) {
+              super(url);
+              realSockets.push(this);
+            }
+          },
+        );
+        stash(
+          'AudioContext',
+          class {
+            constructor() {
+              return createGeminiTransportAudioFake();
+            }
+          },
+        );
+        stash('AudioWorkletNode', GeminiTransportWorkletNodeFake);
+      } else {
+        stash('WebSocket', class {}); // capability gate only
+        stash('fetch', async () => {
+          throw new Error('unexpected network call');
+        });
+      }
       t.after(() => {
         for (const [name, descriptor] of Object.entries(saved)) {
           if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -3267,6 +3325,136 @@ function geminiControllerHarness({ runner } = {}) {
       });
     },
   };
+}
+
+/** WebSocket fake that completes its own handshake on a microtask. */
+class SelfOpeningFakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.sent = [];
+    this.closeCalls = [];
+    queueMicrotask(() => {
+      if (this.readyState !== 0) return;
+      this.readyState = 1;
+      this.onopen?.({});
+    });
+  }
+
+  send(data) {
+    if (this.readyState !== 1) throw new Error('WebSocket is not open');
+    this.sent.push(JSON.parse(data));
+  }
+
+  close(code = 1000, reason = '') {
+    this.closeCalls.push({ code, reason });
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.onclose?.({ code, reason, wasClean: true });
+  }
+
+  message(payload) {
+    this.onmessage?.({ data: JSON.stringify(payload) });
+  }
+}
+
+/** Minimal AudioContext fake for the REAL transport's capture wiring. */
+function createGeminiTransportAudioFake() {
+  return {
+    sampleRate: 48000,
+    currentTime: 0,
+    destination: {},
+    createBuffer: () => ({ getChannelData: () => new Float32Array(4) }),
+    createBufferSource: () => ({
+      connect() {},
+      disconnect() {},
+      start() {},
+      stop() {},
+    }),
+    createMediaStreamSource: () => ({ connect() {}, disconnect() {} }),
+    createGain: () => ({
+      gain: { value: 1 },
+      connect() {},
+      disconnect() {},
+    }),
+    audioWorklet: { async addModule() {} },
+    async close() {},
+  };
+}
+
+class GeminiTransportWorkletNodeFake {
+  constructor() {
+    this.listeners = new Map();
+    this.port = {
+      addEventListener: (type, fn) => this.listeners.set(type, fn),
+      removeEventListener: (type) => this.listeners.delete(type),
+    };
+  }
+
+  connect() {}
+
+  disconnect() {}
+}
+
+/** Install a fresh, bright Cesium canvas that encodes to a deterministic JPEG. */
+function installBrightViewportCapture(t) {
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const windowObject = globalThis.window;
+  const originalView = windowObject.__godsEyeView;
+  const source = { width: 100, height: 80 };
+  let postRenderListener = null;
+  globalThis.window.__godsEyeView = {
+    viewer: {
+      scene: {
+        canvas: source,
+        postRender: {
+          addEventListener(listener) {
+            postRenderListener = listener;
+            return () => {
+              if (postRenderListener === listener) postRenderListener = null;
+            };
+          },
+        },
+        requestRender() {
+          queueMicrotask(() => postRenderListener?.());
+        },
+      },
+    },
+  };
+  const createCanvas = () => {
+    const canvas = {
+      width: 0,
+      height: 0,
+      toDataURL: () => 'data:image/jpeg;base64,aGVsbG8=',
+      getContext() {
+        return {
+          canvas,
+          drawImage() {},
+          getImageData() {
+            return { data: Uint8ClampedArray.from([255, 255, 255, 255]) };
+          },
+        };
+      },
+    };
+    return canvas;
+  };
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    writable: true,
+    value: {
+      hidden: false,
+      createElement: (tag) => (tag === 'canvas' ? createCanvas() : null),
+      querySelector: () => null,
+    },
+  });
+  t.after(() => {
+    windowObject.__godsEyeView = originalView;
+    if (originalDocument) {
+      Object.defineProperty(globalThis, 'document', originalDocument);
+    } else {
+      delete globalThis.document;
+    }
+  });
 }
 
 test('start() selects the Gemini transport when the pending provider is gemini', async (t) => {
@@ -3358,6 +3546,18 @@ test('a fatal Gemini transport error routes into the controller error path', asy
   assert.equal(f.getTransport().stopCalls, 1);
 });
 
+test('Gemini callback currency is bound to the start epoch', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+  const callbacks = f.getCallbacks();
+
+  assert.equal(callbacks.isCurrent(), true, 'current in the epoch that created it');
+  f.controller.startEpoch += 1;
+  assert.equal(callbacks.isCurrent(), false, 'stale after a successor epoch begins');
+});
+
 test('Gemini interruptions mark a user turn, cancel the radio handoff, and duck Radio', async (t) => {
   const f = geminiControllerHarness();
   f.installGlobals(t);
@@ -3369,6 +3569,11 @@ test('Gemini interruptions mark a user turn, cancel the radio handoff, and duck 
   f.getCallbacks().onInterrupted();
 
   assert.equal(f.controller.userTurnPending, true);
+  assert.deepEqual(
+    f.getTransport().abortToolCalls,
+    ['interrupted'],
+    'barge-in aborts tools from the old turn',
+  );
   assert.equal(f.controller.ui.root.dataset.speaker, 'user');
   assert.ok(f.radio.includes('pause'), JSON.stringify(f.radio));
   assert.ok(f.radio.includes('duck'), JSON.stringify(f.radio));
@@ -3430,6 +3635,66 @@ test('a Gemini radio playback handoff stops voice after the tool responses are s
   assert.equal(f.getTransport().stopCalls, 1);
 });
 
+test('I1: the REAL startPendingRadioHandoff commits through the Gemini transport channel', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  f.controller.radioLayer.playForVoice = () => {
+    f.radio.push('playForVoice');
+    return true;
+  };
+  await f.controller.start();
+  f.radio.length = 0;
+
+  // Stage a successful play that requests playback, then complete the turn.
+  // The REAL startPendingRadioHandoff runs (no stub): on a Gemini session the
+  // handoff channel is the transport, so isCurrent holds and stopVoice runs.
+  f.getCallbacks().onToolResult({
+    ok: true,
+    action: 'control_radio',
+    radioAction: 'play',
+    radioPlaybackRequested: true,
+  });
+  f.getCallbacks().onTurnComplete();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.ok(f.radio.includes('playForVoice'), JSON.stringify(f.radio));
+  assert.ok(
+    !f.radio.some((event) => event.startsWith('stopPlayback:')),
+    `handoff was not cancelled: ${JSON.stringify(f.radio)}`,
+  );
+  assert.equal(f.controller.status, 'idle', 'stopVoice ended the session');
+  assert.equal(f.controller.voiceTransport, null);
+  assert.equal(f.getTransport().stopCalls, 1, 'stopVoice tore the transport down');
+});
+
+test('I1: a failed Gemini handoff sends the spoken correction through the transport', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  f.controller.radioLayer.playForVoice = () => false;
+  await f.controller.start();
+  const transport = f.getTransport();
+
+  f.getCallbacks().onToolResult({
+    ok: true,
+    action: 'control_radio',
+    radioAction: 'play',
+    radioPlaybackRequested: true,
+  });
+  f.getCallbacks().onTurnComplete();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(f.controller.status, 'listening');
+  assert.deepEqual(transport.sentText, [
+    {
+      text: 'Say exactly one short correction: “The Radio station could not start. Voice is still on.”',
+    },
+  ]);
+});
+
 test('Gemini usage metadata is recorded without dollar claims or a cap', async (t) => {
   const f = geminiControllerHarness();
   f.installGlobals(t);
@@ -3455,12 +3720,147 @@ test('sendTextCommand routes through the Gemini transport and marks a user turn'
   f.installGlobals(t);
   f.controller.setVoiceProvider('gemini');
   await f.controller.start();
+  const transport = f.getTransport();
 
   f.controller.sendTextCommand('fly to Tokyo');
-  const transport = f.getTransport();
+  await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(transport.sentText, [{ text: 'fly to Tokyo' }]);
   assert.equal(f.controller.userTurnPending, true);
+  assert.deepEqual(
+    transport.abortToolCalls,
+    ['typed-user-turn'],
+    'the new typed turn aborts tools from the previous turn',
+  );
+});
+
+test('C1: a typed command is answered even when the model replies with only a tool call', async (t) => {
+  const toolCalls = [];
+  const f = geminiControllerHarness({
+    useRealTransport: true,
+    runner: async (name, args) => {
+      toolCalls.push({ name, args });
+      return { ok: true, action: name };
+    },
+  });
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+
+  // A REAL Gemini transport: the controller's real isCurrent predicate is what
+  // refuses stale calls, so the typed-command fix must be observable through
+  // the actual transport wiring, not a fake.
+  await f.controller.start();
+  const socket = f.realSockets.at(-1);
+  assert.equal(f.controller.status, 'listening');
+
+  // Typed command: userTurnPending goes true and the completing text turn is
+  // sent. The model's answer to THIS turn contains no audio part — only a
+  // tool call. The tool must still execute.
+  f.controller.sendTextCommand('fly to Tokyo');
+  assert.equal(f.controller.userTurnPending, true);
+
+  socket.message({
+    toolCall: {
+      functionCalls: [{ id: 'c1', name: 'fly_to_location', args: { q: 'Tokyo' } }],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(toolCalls, [
+    { name: 'fly_to_location', args: { q: 'Tokyo' } },
+  ]);
+  assert.ok(
+    socket.sent.some((m) => m.toolResponse),
+    'the executed call is answered on the wire',
+  );
+});
+
+test('C1: a post-barge-in tool-only turn still executes', async (t) => {
+  const toolCalls = [];
+  const f = geminiControllerHarness({
+    useRealTransport: true,
+    runner: async (name) => {
+      toolCalls.push(name);
+      return { ok: true, action: name };
+    },
+  });
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+
+  await f.controller.start();
+  const socket = f.realSockets.at(-1);
+
+  // Barge-in marks a pending user turn (the user is speaking again)...
+  socket.message({ serverContent: { interrupted: true } });
+  assert.equal(f.controller.userTurnPending, true);
+
+  // ...and the server's response to that interruption is tool-only.
+  socket.message({
+    toolCall: {
+      functionCalls: [{ id: 'barge-1', name: 'zoom_camera', args: {} }],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(toolCalls, ['zoom_camera']);
+});
+
+test('I2: Gemini get_entity_context attaches the current viewport as inline image context', async (t) => {
+  const result = {
+    ok: true,
+    action: 'get_entity_context',
+    visible: [],
+    scene: {
+      basemap: {
+        viewScale: 'local',
+        nearbyPlaces: [],
+        knownLandmarks: [],
+      },
+    },
+  };
+  const f = geminiControllerHarness({
+    useRealTransport: true,
+    runner: async () => result,
+  });
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  installBrightViewportCapture(t);
+
+  await f.controller.start();
+  const socket = f.realSockets.at(-1);
+  socket.message({
+    toolCall: {
+      functionCalls: [{ id: 'ctx-1', name: 'get_entity_context', args: {} }],
+    },
+  });
+  for (let i = 0; i < 8; i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const imageIndex = socket.sent.findIndex(
+    (message) => message.clientContent?.turns?.[0]?.content?.[0]?.inlineData,
+  );
+  const toolResponseIndex = socket.sent.findIndex((message) => message.toolResponse);
+  assert.ok(imageIndex >= 0, 'the viewport image was sent');
+  assert.ok(
+    imageIndex < toolResponseIndex,
+    'image context reaches Gemini before the tool response triggers follow-up',
+  );
+  assert.deepEqual(
+    socket.sent[imageIndex].clientContent.turns[0].content[0].inlineData,
+    { mimeType: 'image/jpeg', data: 'aGVsbG8=' },
+  );
+  assert.equal(
+    socket.sent.some((message) => message.type === 'conversation.item.delete'),
+    false,
+    'Gemini never receives OpenAI item-deletion events',
+  );
 });
 
 test('sendTextCommand still throws when no voice session is connected', () => {

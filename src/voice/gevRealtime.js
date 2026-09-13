@@ -645,12 +645,20 @@ export class GevRealtimeController {
    */
   geminiTransportCallbacks(epoch) {
     return {
+      isCurrent: () => (
+        epoch === this.startEpoch
+        && this.voiceTransport !== null
+        && !this.userTurnPending
+        && this.status !== 'idle'
+        && this.status !== 'error'
+      ),
       onState: (state) => {
         this.debugLog('gemini.transport.state', { phase: state?.phase });
       },
       onInterrupted: () => {
         this.userTurnPending = true;
         this.pendingResponseInstructions = null;
+        this.voiceTransport?.abortTools?.('interrupted');
         this.cancelRadioHandoff({ abortTools: true });
         this.setVoiceSpeaker('user');
       },
@@ -695,7 +703,7 @@ export class GevRealtimeController {
           ...(info?.fatal ? { fatal: true } : {}),
         });
       },
-      onToolResult: (result) => {
+      onToolResult: async (result) => {
         this.debugLog('tool.result', { result });
         if (result?.ok && result.radioPlaybackRequested) {
           this.pendingRadioPlaybackResult = result;
@@ -705,6 +713,16 @@ export class GevRealtimeController {
           && ['disable', 'pause', 'stop'].includes(result.radioAction)
         ) {
           this.cancelRadioHandoff();
+        }
+        // Gemini has no OpenAI conversation-item API. Send the optional viewport
+        // directly as a non-completing inline image turn; its server-side
+        // context window owns retention, so no item-deletion emulation exists.
+        try {
+          await this.sendVisualContextIfUseful(result);
+        } catch (error) {
+          this.debugLog('viewport_context.failed', {
+            error: error?.message || String(error),
+          });
         }
       },
       onAfterToolResponses: (results) => {
@@ -1229,8 +1247,10 @@ export class GevRealtimeController {
     if (!cleanText) return;
     this.cancelRadioHandoff({ abortTools: true });
     if (onGemini) {
-      // Gemini's turn model is push-to-talk: the completing user turn itself
-      // solicits the answer; superseding is handled through isCurrent().
+      // Abort calls from the previous turn before admitting this one. The
+      // transport's ID dedupe and the epoch-bound isCurrent predicate remain
+      // the stale-old-turn guards for calls that arrive later.
+      this.voiceTransport.abortTools?.('typed-user-turn');
       this.userTurnPending = true;
       this.voiceTransport.sendText(cleanText);
       return;
@@ -1687,18 +1707,30 @@ export class GevRealtimeController {
   }
 
   async sendVisualContextIfUseful(result) {
-    if (result?.action !== 'get_entity_context' || !this.dc || this.dc.readyState !== 'open') return false;
+    const geminiTransport =
+      this.voiceTransport?.readyState === 'open' ? this.voiceTransport : null;
+    const openAiOpen = this.dc?.readyState === 'open';
+    if (
+      result?.action !== 'get_entity_context'
+      || (!geminiTransport && !openAiOpen)
+    ) return false;
     const viewScale = result.scene?.basemap?.viewScale;
     if (!shouldSendViewportImage(viewScale)) return false;
     if (hasStructuredViewIdentity(result)) return false;
     const imageUrl = await captureViewportImage();
     if (!imageUrl) return false;
 
-    // Keep at most one viewport screenshot in context. Images are the single
-    // most expensive item (re-billed every turn they linger), so we proactively
-    // delete the previous one before adding a new one. Text history is left to
-    // the server-side retention_ratio truncation (see /api/realtime/token) —
-    // deleting old text per-turn busts the prompt cache for little gain.
+    if (geminiTransport) {
+      const imagePart = dataUrlToInlineImagePart(imageUrl);
+      if (!imagePart) return false;
+      return geminiTransport.sendImage(imagePart);
+    }
+
+    // OpenAI only: keep at most one viewport screenshot in context. Images are
+    // the single most expensive item (re-billed every turn they linger), so we
+    // proactively delete the previous one before adding a new one. Gemini has
+    // no item-deletion protocol; its bounded server-side context owns history.
+    // Text history is left to server-side retention_ratio truncation.
     if (this.lastViewportItemId) {
       // Tag the delete with our own event_id and remember it. If the item was
       // already server-truncated, the item_not_found error echoes this id and we
@@ -1901,7 +1933,9 @@ export class GevRealtimeController {
     this.pendingRadioPlaybackResult = null;
     const handoffEpoch = ++this.radioHandoffEpoch;
     const handoffAttemptId = `voice-radio-${this.sessionId}-${handoffEpoch}`;
-    const handoffChannel = this.dc;
+    // OpenAI owns a WebRTC data channel; Gemini owns a WebSocket transport.
+    // Both expose the provider-neutral readyState === 'open' contract.
+    const handoffChannel = this.dc ?? this.voiceTransport;
     this.radioHandoffInFlight = true;
     this.radioHandoffAttemptId = handoffAttemptId;
     this.radioHandoffInFlightResult = pendingResult;
@@ -1920,7 +1954,7 @@ export class GevRealtimeController {
         && !this.isRadioHandoffReserved()
         && handoffEpoch === this.radioHandoffEpoch
         && !this.userTurnPending
-        && this.dc === handoffChannel
+        && (this.dc ?? this.voiceTransport) === handoffChannel
         && handoffChannel?.readyState === 'open'
       ),
     });
@@ -1934,9 +1968,15 @@ export class GevRealtimeController {
     }
     this.debugLog('tool.radio_handoff', { result: radioHandoff.result });
     if (radioHandoff.result?.ok || radioHandoff.cancelled || !stillCurrent) return;
-    if (this.dc?.readyState === 'open' && !this.userTurnPending) {
+    const currentChannel = this.dc ?? this.voiceTransport;
+    if (currentChannel?.readyState === 'open' && !this.userTurnPending) {
       this.setStatus('listening', 'Radio did not start');
-      this.queueResponseCreate('Say exactly one short correction: “The Radio station could not start. Voice is still on.”');
+      const correction = 'Say exactly one short correction: “The Radio station could not start. Voice is still on.”';
+      if (currentChannel === this.voiceTransport) {
+        this.voiceTransport.sendText(correction);
+      } else {
+        this.queueResponseCreate(correction);
+      }
     }
   }
 
@@ -2375,20 +2415,24 @@ export class GevRealtimeController {
  * newer user turn intervened.
  */
 function createGeminiLiveTransport(callbacks) {
+  const { isCurrent, ...handlers } = callbacks;
   return new GeminiLiveTransport({
-    ...callbacks,
+    ...handlers,
     runner: (name, args, options) => this.runner(name, args, options),
-    isCurrent: () => (
-      this.voiceTransport !== null
-      && !this.userTurnPending
-      && this.status !== 'idle'
-      && this.status !== 'error'
-    ),
+    isCurrent,
   });
 }
 
 function shouldSendViewportImage(viewScale) {
   return viewScale === 'local';
+}
+
+/** Convert a base64 data URL into Gemini's inline image-part shape. */
+function dataUrlToInlineImagePart(dataUrl) {
+  if (typeof dataUrl !== 'string') return null;
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]+=*)$/.exec(dataUrl);
+  if (!match) return null;
+  return { mimeType: match[1], data: match[2] };
 }
 
 function hasStructuredViewIdentity(result) {

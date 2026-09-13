@@ -19,6 +19,10 @@ import {
 
 const DEFAULT_SERVED_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 
+// Mirrors the transport's time-based dedupe window; the tests pin expiry by
+// observable re-dispatch rather than inspecting private memory.
+const CALL_DEDUPE_MS = 2500;
+
 function tokenResponse({
   token = 'ephemeral-token-abc123',
   model = DEFAULT_SERVED_MODEL,
@@ -416,32 +420,49 @@ test('setup carries the server-resolved model, not the browser choice string', a
 });
 
 test('the PCM capture worklet module is loaded before startInput', async () => {
-  const f = createHarness();
+  const order = [];
+  const context = createAudioContextFake();
+  context.audioWorklet.addModule = async (url) => {
+    order.push('addModule');
+    context.modules.push(url);
+  };
+  const session = createSessionFake();
+  session.startInput = async (onChunk, stream) => {
+    order.push('startInput');
+    session.onChunk = onChunk;
+    session.stream = stream;
+    session.started = true;
+  };
+  const f = createHarness({
+    createAudioContext: () => context,
+    createAudioSession: () => session,
+  });
   await f.connect();
-  const session = f.sessions.at(-1);
-  const context = f.contextPool[0];
 
+  assert.deepEqual(
+    order,
+    ['addModule', 'startInput'],
+    'the worklet module loads before capture starts',
+  );
   assert.deepEqual(context.modules, [PCM_CAPTURE_MODULE_URL]);
   assert.ok(session.started, 'session input started');
   assert.deepEqual(session.stream, { id: 'mic' });
 });
 
-test('microphone chunks are sent as realtimeInput 16 kHz PCM before nothing else precedes setup', async () => {
+test('microphone chunks are sent as realtimeInput 16 kHz PCM after setup', async () => {
   const f = createHarness();
   const socket = await f.connect();
   const session = f.sessions.at(-1);
 
   session.onChunk(AUDIO_CHUNK);
-  assert.deepEqual(socket.sent.at(-1), {
+  assert.equal(socket.sent.length, 2, 'setup, then the mic chunk');
+  assert.ok(socket.sent[0].setup, 'setup remains the first message');
+  assert.equal(socket.sent[0].setup.model, `models/${DEFAULT_SERVED_MODEL}`);
+  assert.deepEqual(socket.sent[1], {
     realtimeInput: {
       audio: { data: AUDIO_CHUNK, mimeType: 'audio/pcm;rate=16000' },
     },
   });
-  assert.equal(
-    socket.sent[0].setup,
-    socket.sent[0].setup,
-    'setup remains the first message',
-  );
 });
 
 test('mic chunks captured through the real GeminiPcmAudioSession reach the wire as 16 kHz PCM', async () => {
@@ -525,6 +546,69 @@ test('modelTurn inlineData audio is enqueued for playback and reports activity o
     f.callbacks.assistantTurnStarts,
     1,
     'turn start reported once per model turn',
+  );
+});
+
+test('a tool-only turn (no audio part) reports its turn start', async () => {
+  const f = createHarness({
+    runner: async () => ({ ok: true }),
+  });
+  const socket = await f.connect();
+
+  socket.message({
+    toolCall: { functionCalls: [{ id: 't1', name: 'fly_to', args: {} }] },
+  });
+  await flush();
+
+  assert.equal(
+    f.callbacks.assistantTurnStarts,
+    1,
+    'a turn whose only output is a tool call still begins',
+  );
+});
+
+test('a completing client text turn resets an older assistant turn before tool-only output', async () => {
+  const calls = [];
+  const f = createHarness({
+    runner: async (name) => {
+      calls.push(name);
+      return { ok: true };
+    },
+  });
+  const socket = await f.connect();
+  socket.message({
+    serverContent: {
+      modelTurn: { parts: [{ inlineData: { data: AUDIO_CHUNK } }] },
+    },
+  });
+  assert.equal(f.callbacks.assistantTurnStarts, 1, 'old turn started');
+
+  f.transport.sendText('fly to Tokyo');
+  socket.message({
+    toolCall: { functionCalls: [{ id: 't2', name: 'fly_to', args: {} }] },
+  });
+  await flush();
+
+  assert.equal(f.callbacks.assistantTurnStarts, 2, 'new tool-only turn started');
+  assert.deepEqual(calls, ['fly_to']);
+});
+
+test('a text-only modelTurn part reports its turn start', async () => {
+  const f = createHarness();
+  const socket = await f.connect();
+  const session = f.sessions.at(-1);
+
+  socket.message({
+    serverContent: {
+      modelTurn: { parts: [{ text: 'Tokyo, on it.' }] },
+    },
+  });
+
+  assert.equal(f.callbacks.assistantTurnStarts, 1);
+  assert.deepEqual(
+    session.enqueued,
+    [],
+    'no audio part means nothing is scheduled for playback',
   );
 });
 
@@ -620,6 +704,27 @@ test('sendImage sends inline image data as context without completing a turn', a
       turnComplete: false,
     },
   });
+});
+
+test('a fatal setup rejection arriving before start() resolves is not lost', async () => {
+  const f = createHarness();
+  const starting = f.transport.start({ modelChoice: 'gemini-2.5' });
+  await new Promise((resolve) => setImmediate(resolve));
+  const socket = f.sockets.at(-1);
+
+  // The server can speak first: a rejected setup closes the socket while our
+  // own start() is still between the open handshake and its audio wiring.
+  socket.open();
+  socket.message({
+    error: { code: 400, message: 'invalid setup payload' },
+  });
+
+  await assert.rejects(starting, /invalid setup payload/);
+  assert.equal(
+    f.callbacks.errors.length,
+    0,
+    'the start rejection owns connect-time failures (no duplicate onError)',
+  );
 });
 
 test('client content before the socket opens is refused, not queued', async () => {
@@ -796,6 +901,66 @@ test('duplicate call IDs are deduplicated to one dispatch and one response', asy
   assert.equal(socket.sent.filter((m) => m.toolResponse).length, 1);
 });
 
+test('the processed-call dedupe memory expires old IDs', async () => {
+  const calls = [];
+  let clock = 0;
+  const f = createHarness({
+    now: () => clock,
+    runner: async (name) => {
+      calls.push(name);
+      return { ok: true };
+    },
+  });
+  const socket = await f.connect();
+  const event = {
+    toolCall: { functionCalls: [{ id: 'reused-id', name: 'tool_x', args: {} }] },
+  };
+
+  socket.message(event);
+  await flush();
+  clock += CALL_DEDUPE_MS + 1;
+  socket.message(event);
+  await flush();
+
+  assert.deepEqual(
+    calls,
+    ['tool_x', 'tool_x'],
+    'the old dedupe entry expired so the later call could dispatch',
+  );
+  assert.equal(socket.sent.filter((m) => m.toolResponse).length, 2);
+});
+
+test('the processed-call dedupe memory evicts the oldest ID at its hard ceiling', async () => {
+  const calls = [];
+  const f = createHarness({
+    runner: async (_name, args) => {
+      calls.push(args.index);
+      return { ok: true };
+    },
+  });
+  const socket = await f.connect();
+  const batch = Array.from({ length: 65 }, (_, index) => ({
+    id: `dense-${index}`,
+    name: 'tool_x',
+    args: { index },
+  }));
+
+  socket.message({ toolCall: { functionCalls: batch } });
+  await flush();
+  socket.message({
+    toolCall: {
+      functionCalls: [{ id: 'dense-0', name: 'tool_x', args: { index: 0 } }],
+    },
+  });
+  await flush();
+
+  assert.equal(
+    calls.length,
+    66,
+    'the oldest ID was evicted, so reusing it dispatches again',
+  );
+});
+
 test('malformed arguments are normalized and malformed calls still get a terminal response', async () => {
   const calls = [];
   const f = createHarness({
@@ -894,6 +1059,33 @@ test('a non-JSON-serializable result is replaced with a terminal placeholder', a
     .toolResponse.functionResponses;
   assert.equal(responses[0].response.ok, false);
   assert.match(responses[0].response.error, /not JSON-serializable/i);
+});
+
+test('abortTools() cancels in-flight calls without closing the session', async () => {
+  let signal = null;
+  let release = null;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const f = createHarness({
+    runner: async (_name, _args, options) => {
+      signal = options.signal;
+      await gate;
+      return { ok: false, stale: true };
+    },
+  });
+  const socket = await f.connect();
+  socket.message({
+    toolCall: { functionCalls: [{ id: 'old', name: 'slow_tool', args: {} }] },
+  });
+  await flush();
+
+  f.transport.abortTools('new-user-turn');
+
+  assert.equal(signal.aborted, true, 'the old tool received an abort');
+  assert.equal(f.transport.readyState, 'open', 'the voice session stays open');
+  release();
+  await flush();
 });
 
 test('stop() aborts in-flight tool calls and skips their responses once closed', async () => {
