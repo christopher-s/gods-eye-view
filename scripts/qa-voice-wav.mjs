@@ -59,8 +59,30 @@ try {
   await page.goto(appUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await page.waitForFunction(() => (
     window.__godsEyeView?.voiceCommands
+    && window.__gevVoiceCommands?.runner
     && document.getElementById('gev-voice-button')
+    && document.getElementById('gev-voice-provider')
+    && document.getElementById('gev-voice-model')
   ), { timeout: 30_000 });
+
+  const requestedProvider = process.env.GEV_QA_VOICE_PROVIDER || 'gemini';
+  const requestedModel = process.env.GEV_QA_VOICE_MODEL || 'gemini-2.5';
+  const selection = await page.evaluate(({ providerValue, modelValue }) => {
+    const provider = document.getElementById('gev-voice-provider');
+    const model = document.getElementById('gev-voice-model');
+    provider.value = providerValue;
+    provider.dispatchEvent(new Event('change', { bubbles: true }));
+    model.value = modelValue;
+    model.dispatchEvent(new Event('change', { bubbles: true }));
+    return {
+      provider: provider.value,
+      model: model.value,
+      pending: window.__gevVoiceCommands?.getDiagnostics?.().pendingVoiceSelection || null,
+    };
+  }, { providerValue: requestedProvider, modelValue: requestedModel });
+  if (selection.provider !== requestedProvider || selection.model !== requestedModel) {
+    throw new Error(`Voice selection unavailable: ${requestedProvider}/${requestedModel}`);
+  }
 
   const readState = () => page.evaluate(() => {
     const voice = window.__godsEyeView?.voiceCommands;
@@ -120,6 +142,7 @@ try {
     fixture: wavPath,
     fixtureSha256,
     appUrl,
+    selection,
     elapsedMs: finalState.at - initial.at,
     finalState,
     timeline,

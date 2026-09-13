@@ -383,7 +383,8 @@ Six keys. Four have a free tier, and the two 🔴 ones are metered:
 |---|-----|-----|--------|
 | 🟡 | **Cesium ion** | 🗺️ Google Photorealistic 3D, world terrain, and additional ion-hosted imagery stacks. The free Community plan is for eligible individual, personal/non-commercial use and has quotas | [cesium.com/ion](https://cesium.com/ion) — use a public `assets:read` token and check current [pricing/eligibility](https://cesium.com/platform/cesium-ion/pricing/) |
 | 🔴 | **Google Maps** | Direct Google Photorealistic 3D + Google place search ([Map Tiles API](https://developers.google.com/maps/documentation/tile)) | [Google Cloud Console](https://console.cloud.google.com/) — URL-restrict it |
-| 🔴 | **OpenAI** | 🎙️ The voice experience + AI HUD summary. The mini model works; the standard model is noticeably smarter. Want Gemini or another provider behind the mic? PRs welcome | [platform.openai.com](https://platform.openai.com) — metered, see costs below |
+| 🔴 | **OpenAI** | 🎙️ OpenAI Realtime voice and AI HUD summary. The mini model works; the standard model is noticeably smarter | [platform.openai.com](https://platform.openai.com) — metered, see costs below |
+| 🔴 | **Gemini** | 🎙️ Gemini Live native-audio voice. The browser receives a one-use, short-lived token from the same-origin app server; the permanent key stays server-side | [Google AI Studio](https://aistudio.google.com/apikey) — check current Live API access and pricing |
 | 🟡 | **AISStream** | 🚢 Live global ships | [aisstream.io](https://aisstream.io) — free signup |
 | 🟡 | **NASA FIRMS** | 🔥 Live active fires | [firms.modaps.eosdis.nasa.gov](https://firms.modaps.eosdis.nasa.gov/api/map_key/) — free |
 | 🟡 | **TomTom** | 🚦 Live flow speeds and congestion colors for the simulated traffic layer | [developer.tomtom.com](https://developer.tomtom.com) — free tier available |
@@ -416,7 +417,7 @@ For headless machines, coding agents, or scripted setups:
 
 ```bash
 # Put keys in .env (see .env.example), or pass them as env vars:
-OPENAI_API_KEY="…" AISSTREAM_API_KEY="…" npm run dev -- --host localhost --port 4173
+OPENAI_API_KEY="…" GEMINI_API_KEY="…" AISSTREAM_API_KEY="…" npm run dev -- --host localhost --port 4173
 
 # On macOS, store any of them in the Keychain and dev-fresh.sh pulls them in:
 security add-generic-password -U -s "google-maps-api" -a "api-key" -w
@@ -429,6 +430,62 @@ security add-generic-password -U -s "cesium-ion"      -a "token"   -w
 OpenSky can run fully anonymous (`OPENSKY_AUTH_MODE=anon`), or import OAuth credentials with `./scripts/opensky-import-client.sh /path/to/credentials.json`.
 
 </details>
+
+### Voice providers, models, and QA
+
+The MIC panel exposes independent native selectors:
+
+- Provider: `#gev-voice-provider`
+  - `gemini` — **Gemini Live** (default for new selections)
+  - `openai` — **OpenAI Realtime**
+- Model: `#gev-voice-model`; its options change with the provider.
+  - `gemini-2.5` — **Gemini 2.5 Flash Native Audio Dialog** — `gemini-2.5-flash-native-audio-preview-12-2025` (Gemini default)
+  - `gemini-3` — **Gemini 3 Flash Live** — `gemini-3.1-flash-live-preview`
+  - `standard` — **Standard** (OpenAI Realtime)
+  - `mini` — **Mini** (OpenAI Realtime)
+
+Selector changes apply to the next session. The public browser QA surface remains
+`window.__gevVoiceCommands`; `runner(toolName, args)` drives GEV tools without a
+microphone and `getDiagnostics()` reports active and pending selections.
+
+Gemini server configuration:
+
+```bash
+GEMINI_API_KEY="…"                 # required for credentialed Gemini Live sessions
+GEMINI_LIVE_MODEL="…"              # optional authoritative override for gemini-2.5
+GEMINI_LIVE_MODEL_3="…"            # optional authoritative override for gemini-3
+GEV_RATELIMIT_GEMINI_PER_MIN=10     # optional token-mint limit; 10 by default
+```
+
+`POST /api/gemini-live/token?model=<choice>` is same-origin for browsers and also
+accepts CLI requests that omit `Origin`. The permanent API key is used only by the
+server to mint one-use, short-lived, model-constrained tokens. It is never returned
+to the browser. Gemini diagnostics record duration and provider usage metadata;
+they do not claim a dollar cost or use the OpenAI dollar cap.
+
+Local QA commands:
+
+```bash
+# Credential-free protocol/redaction smoke with injected mock token and socket
+npm run qa:gemini-live -- --dry-run
+
+# Credentialed smoke against a supplied local/LAN base URL
+npm run qa:gemini-live -- --base-url http://127.0.0.1:4173 --model gemini-2.5
+
+# Browser selector/debug routing QA against a running app
+node scripts/qa-voice-routing.mjs --layer behavior --url http://127.0.0.1:4173
+
+# Prerecorded-microphone acceptance; defaults to Gemini 2.5
+GEV_QA_VOICE_PROVIDER=gemini GEV_QA_VOICE_MODEL=gemini-2.5 \
+  node scripts/qa-voice-wav.mjs http://127.0.0.1:4173
+
+# Preserve the OpenAI prerecorded path explicitly
+GEV_QA_VOICE_PROVIDER=openai GEV_QA_VOICE_MODEL=standard \
+  node scripts/qa-voice-wav.mjs http://127.0.0.1:4173
+```
+
+The smoke script has a bounded timeout, closes the socket cleanly, and redacts
+access tokens, API-key-shaped values, and known secrets from errors and output.
 
 ### 💸 What it actually costs
 

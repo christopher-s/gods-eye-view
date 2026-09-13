@@ -399,6 +399,74 @@ async function runBehaviorLayer() {
       () => window.__godsEyeView?.viewer && window.__gevVoiceCommands?.runner && window.__gevAnnotations,
       { timeout: 120000, polling: 250 },
     );
+    // Verify the independent selection surface and the preserved public debug
+    // controller before exercising commands. Changing pending provider/model
+    // must not require a microphone or silently remove the OpenAI path.
+    const selectionSurface = await page.evaluate(() => {
+      const provider = document.getElementById('gev-voice-provider');
+      const model = document.getElementById('gev-voice-model');
+      const commands = window.__gevVoiceCommands;
+      const optionSnapshot = (select) => Array.from(select?.options || []).map((option) => ({
+        value: option.value,
+        label: option.textContent.trim(),
+      }));
+      const select = (element, value) => {
+        element.value = value;
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+      const initial = commands?.getDiagnostics?.();
+      const providerOptions = optionSnapshot(provider);
+      select(provider, 'openai');
+      const openAiModels = optionSnapshot(model);
+      select(model, 'mini');
+      const openAiPending = commands?.getDiagnostics?.().pendingVoiceSelection;
+      select(provider, 'gemini');
+      const geminiModels = optionSnapshot(model);
+      select(model, 'gemini-3');
+      const geminiPending = commands?.getDiagnostics?.().pendingVoiceSelection;
+      select(model, 'gemini-2.5');
+      return {
+        hasRunner: typeof commands?.runner === 'function',
+        hasDiagnostics: typeof commands?.getDiagnostics === 'function',
+        providerOptions,
+        openAiModels,
+        geminiModels,
+        initialPending: initial?.pendingVoiceSelection,
+        openAiPending,
+        geminiPending,
+      };
+    });
+    report(
+      selectionSurface.hasRunner
+        && selectionSurface.hasDiagnostics
+        && JSON.stringify(selectionSurface.providerOptions) === JSON.stringify([
+          { value: 'gemini', label: 'Gemini Live' },
+          { value: 'openai', label: 'OpenAI Realtime' },
+        ]),
+      'behavior: voice provider selector and debug surface are public',
+      `providers=${JSON.stringify(selectionSurface.providerOptions)} runner=${selectionSurface.hasRunner}`,
+    );
+    report(
+      JSON.stringify(selectionSurface.openAiModels) === JSON.stringify([
+        { value: 'standard', label: 'Standard' },
+        { value: 'mini', label: 'Mini' },
+      ])
+        && selectionSurface.openAiPending?.provider === 'openai'
+        && selectionSurface.openAiPending?.choice === 'mini',
+      'behavior: OpenAI provider/model routing remains selectable',
+      `models=${JSON.stringify(selectionSurface.openAiModels)} pending=${JSON.stringify(selectionSurface.openAiPending)}`,
+    );
+    report(
+      JSON.stringify(selectionSurface.geminiModels) === JSON.stringify([
+        { value: 'gemini-2.5', label: 'Gemini 2.5 Flash Native Audio Dialog' },
+        { value: 'gemini-3', label: 'Gemini 3 Flash Live' },
+      ])
+        && selectionSurface.geminiPending?.provider === 'gemini'
+        && selectionSurface.geminiPending?.choice === 'gemini-3',
+      'behavior: Gemini provider/model controls route independently',
+      `models=${JSON.stringify(selectionSurface.geminiModels)} pending=${JSON.stringify(selectionSurface.geminiPending)}`,
+    );
+
     // House rule: the intro flight clobbers teleports issued mid-flight.
     await page.evaluate(() => window.__godsEyeView.viewer.camera.cancelFlight());
 
