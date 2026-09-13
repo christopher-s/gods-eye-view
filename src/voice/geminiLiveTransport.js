@@ -67,8 +67,11 @@ function defaultCreateAudioSession(audioContext) {
  *
  * The choice is resolved through the provider registry first, so a hostile or
  * unknown value can never be forwarded as an arbitrary upstream model id.
+ * The live API rejects liveConnectConstraints, so the token is unconstrained;
+ * the route's setupConfig carries the session config the browser must repeat
+ * in its setup message.
  *
- * @returns {{token: string, model: string, choice: string}}
+ * @returns {{token: string, model: string, choice: string, setupConfig: Object|null}}
  * @throws {Error} with the server's sanitized reason on failure
  */
 async function mintGeminiToken(choice, fetchImpl) {
@@ -91,10 +94,15 @@ async function mintGeminiToken(choice, fetchImpl) {
   if (typeof data?.token !== 'string' || !data.token) {
     throw new Error('Gemini Live token response did not include a token');
   }
+  const setupConfig =
+    data?.setupConfig && typeof data.setupConfig === 'object'
+      ? data.setupConfig
+      : null;
   return {
     token: data.token,
     model: typeof data?.model === 'string' && data.model ? data.model : null,
     choice: resolvedChoice,
+    setupConfig,
   };
 }
 
@@ -331,16 +339,24 @@ export class GeminiLiveTransport {
       await this.#openSettled.promise;
       this.#rejectIfFinalized();
 
-      // The first message on a Gemini Live socket is always setup. The
-      // constrained ephemeral token already binds system instructions, tools,
-      // and audio-only response modality server-side; the browser repeats the
-      // model and modality as the protocol requires.
-      this.#sendJson({
-        setup: {
-          model: `models/${this.#servedModel}`,
-          generationConfig: { responseModalities: ['AUDIO'] },
-        },
-      });
+      // The first message on a Gemini Live socket is always setup. The live
+      // auth_tokens endpoint rejects liveConnectConstraints, so the ephemeral
+      // token carries NO session config; the token route's setupConfig
+      // supplies systemInstruction and tools, and setup repeats them here or
+      // the session would run without instructions and tools.
+      const setup = {
+        model: `models/${this.#servedModel}`,
+        generationConfig: { responseModalities: ['AUDIO'] },
+      };
+      if (minted.setupConfig) {
+        if (minted.setupConfig.systemInstruction) {
+          setup.systemInstruction = minted.setupConfig.systemInstruction;
+        }
+        if (Array.isArray(minted.setupConfig.tools)) {
+          setup.tools = minted.setupConfig.tools;
+        }
+      }
+      this.#sendJson({ setup });
       this.#log('gemini.setup.sent', { model: this.#servedModel });
 
       const audioContext = this.#createAudioContextChecked();
@@ -457,7 +473,9 @@ export class GeminiLiveTransport {
     if (!cleanText.trim()) return false;
     const sent = this.#sendJson({
       clientContent: {
-        turns: [{ role: 'user', content: [{ text: cleanText }] }],
+        // The live API rejects `content` on a turn (1007 'Unknown name
+        // content at client_content.turns[0]'); turns use `parts`.
+        turns: [{ role: 'user', parts: [{ text: cleanText }] }],
         turnComplete,
       },
     });
@@ -483,7 +501,10 @@ export class GeminiLiveTransport {
     return this.#sendJson({
       clientContent: {
         turns: [
-          { role: 'user', content: [{ inlineData: { mimeType, data } }] },
+          {
+            role: 'user',
+            parts: [{ inlineData: { mimeType, data } }],
+          },
         ],
         turnComplete: false,
       },

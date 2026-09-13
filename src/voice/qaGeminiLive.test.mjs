@@ -155,7 +155,10 @@ test('setup is sent and acknowledged before clientContent under one deadline', a
   assert.equal(socket.sentFrames.length, 2);
   assert.equal(socket.sentFrames[0].setup?.model, 'models/mock-model');
   assert.equal(socket.sentFrames[1].setup, undefined);
-  assert.equal(socket.sentFrames[1].clientContent?.turns?.[0]?.content?.[0]?.text?.length > 0, true);
+  // The live API rejects `content` (1007 'Unknown name content at
+  // client_content.turns[0]'); turns must use `parts`.
+  assert.equal(socket.sentFrames[1].clientContent?.turns?.[0]?.parts?.[0]?.text?.length > 0, true);
+  assert.equal(socket.sentFrames[1].clientContent?.turns?.[0]?.content, undefined);
   assert.equal(socket.sentFrames[1].clientContent.turnComplete, true);
 });
 
@@ -177,6 +180,38 @@ test('clientContent is held back when setupComplete never arrives', { timeout: 5
   );
   assert.equal(sockets[0].sentFrames.length, 1, 'only the setup frame may be sent before setupComplete is observed');
   assert.equal(sockets[0].sentFrames[0].setup !== undefined, true);
+});
+
+test('setup repeats the setupConfig returned by the token route', { timeout: 5000 }, async () => {
+  const sockets = [];
+  class SetupCaptureSocket extends HappySocket {
+    constructor(url) { super(url); sockets.push(this); }
+  }
+  const setupConfig = {
+    systemInstruction: { parts: [{ text: 'You are GEV over watch.' }] },
+    tools: [{ functionDeclarations: [{ name: 'fly_to', parameters: {} }] }],
+  };
+  const result = await createGeminiLiveSmoke({
+    baseUrl: 'http://127.0.0.1:4173',
+    timeoutMs: 2000,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        token: 'mock-token',
+        model: 'mock-model',
+        choice: 'gemini-2.5',
+        provider: 'gemini',
+        setupConfig,
+      }),
+    }),
+    WebSocketClass: SetupCaptureSocket,
+  });
+  assert.equal(result.ok, true);
+  const setup = sockets[0].sentFrames[0].setup;
+  assert.equal(setup.model, 'models/mock-model');
+  assert.deepEqual(setup.systemInstruction, setupConfig.systemInstruction);
+  assert.deepEqual(setup.tools, setupConfig.tools);
 });
 
 // ─────────────────────────────────────────────────────────────

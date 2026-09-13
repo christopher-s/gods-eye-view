@@ -175,7 +175,22 @@ export async function createGeminiLiveSmoke({
     });
 
     // ── Stage 3: setup first; clientContent waits for the acknowledgement ──
-    socket.send(JSON.stringify({ setup: { model: `models/${model}`, generationConfig: { responseModalities: ['AUDIO'] } } }));
+    // The token carries no session constraints (the live auth_tokens endpoint
+    // rejects liveConnectConstraints), so setup repeats the route's
+    // setupConfig when present.
+    const setup = {
+      model: `models/${model}`,
+      generationConfig: { responseModalities: ['AUDIO'] },
+    };
+    if (body?.setupConfig && typeof body.setupConfig === 'object') {
+      if (body.setupConfig.systemInstruction) {
+        setup.systemInstruction = body.setupConfig.systemInstruction;
+      }
+      if (Array.isArray(body.setupConfig.tools)) {
+        setup.tools = body.setupConfig.tools;
+      }
+    }
+    socket.send(JSON.stringify({ setup }));
     await Promise.race([
       waitFor('setup acknowledgement', () => (messages.some((message) => message?.setupComplete !== undefined) ? true : null)),
       deadline,
@@ -185,7 +200,7 @@ export async function createGeminiLiveSmoke({
     if (socket.readyState === 3) {
       throw new Error(`Gemini Live WebSocket closed before the text turn (code ${closeEvent?.code ?? 'unknown'})`);
     }
-    socket.send(JSON.stringify({ clientContent: { turns: [{ role: 'user', content: [{ text: PROMPT }] }], turnComplete: true } }));
+    socket.send(JSON.stringify({ clientContent: { turns: [{ role: 'user', parts: [{ text: PROMPT }] }], turnComplete: true } }));
     const accepted = await Promise.race([
       waitFor('a valid model response', () => {
         const state = protocolAcceptance(messages);

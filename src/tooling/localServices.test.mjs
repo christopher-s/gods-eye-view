@@ -238,7 +238,7 @@ test('Gemini token handler is POST-only and requires a server key', async (t) =>
   assert.deepEqual(missing.json(), { error: 'Gemini Live is not configured' });
 });
 
-test('Gemini token handler allowlists choices, applies env overrides, and mints constrained audio tokens', async (t) => {
+test('Gemini token handler allowlists choices, applies env overrides, and returns browser setup config with a minimal unconstrained mint', async (t) => {
   env(t, 'GEMINI_API_KEY', 'fixture-permanent-gemini-key');
   env(t, 'GEMINI_LIVE_MODEL', 'fixture-gemini-25-model');
   env(t, 'GEMINI_LIVE_MODEL_3', 'fixture-gemini-3-model');
@@ -268,6 +268,22 @@ test('Gemini token handler allowlists choices, applies env overrides, and mints 
       model,
       choice,
       provider: 'gemini',
+      // The live v1beta auth_tokens endpoint rejects liveConnectConstraints
+      // (400 'Unknown name liveConnectConstraints'), so the session config
+      // the browser needs for its setup message rides the route response.
+      setupConfig: {
+        systemInstruction: {
+          parts: [
+            { text: realtimeInstructions('Fixture annotation instruction.') },
+          ],
+        },
+        tools: [
+          {
+            functionDeclarations:
+              geminiFunctionDeclarations(GEV_REALTIME_TOOLS),
+          },
+        ],
+      },
     });
     assert.equal(response.body.includes('fixture-permanent-gemini-key'), false);
     assert.equal(
@@ -283,21 +299,15 @@ test('Gemini token handler allowlists choices, applies env overrides, and mints 
       call.options.headers['x-goog-api-key'],
       'fixture-permanent-gemini-key',
     );
+    // The mint payload carries ONLY the fields the live API accepts: uses
+    // and the two expiry windows. Model/instructions/tools constraints are
+    // rejected upstream today, so they must never appear here.
     assert.equal(call.payload.uses, 1);
-    assert.equal(call.payload.liveConnectConstraints.model, `models/${model}`);
-    assert.deepEqual(
-      call.payload.liveConnectConstraints.config.responseModalities,
-      ['AUDIO'],
-    );
-    assert.equal(
-      call.payload.liveConnectConstraints.config.systemInstruction.parts[0]
-        .text,
-      realtimeInstructions('Fixture annotation instruction.'),
-    );
-    assert.deepEqual(
-      call.payload.liveConnectConstraints.config.tools[0].functionDeclarations,
-      geminiFunctionDeclarations(GEV_REALTIME_TOOLS),
-    );
+    assert.deepEqual(Object.keys(call.payload).sort(), [
+      'expireTime',
+      'newSessionExpireTime',
+      'uses',
+    ]);
     const expiry = Date.parse(call.payload.expireTime);
     const sessionExpiry = Date.parse(call.payload.newSessionExpireTime);
     assert.ok(expiry > Date.now() && expiry <= Date.now() + 31 * 60_000);

@@ -459,9 +459,13 @@ GEV_RATELIMIT_GEMINI_PER_MIN=10     # optional token-mint limit; 10 by default
 
 `POST /api/gemini-live/token?model=<choice>` is same-origin for browsers and also
 accepts CLI requests that omit `Origin`. The permanent API key is used only by the
-server to mint one-use, short-lived, model-constrained tokens. It is never returned
-to the browser. Gemini diagnostics record duration and provider usage metadata;
-they do not claim a dollar cost or use the OpenAI dollar cap.
+server to mint one-use, short-lived tokens. The live `auth_tokens` endpoint
+rejects `liveConnectConstraints`, so the token itself is unconstrained; the route
+response instead carries a server-built `setupConfig` (system instruction and
+tool declarations) that the browser repeats in its WebSocket `setup` message.
+The API key is never returned to the browser. Gemini diagnostics record duration
+and provider usage metadata; they do not claim a dollar cost or use the OpenAI
+dollar cap.
 
 Local QA commands:
 
@@ -500,7 +504,7 @@ Honest numbers, roughly, as of mid-2026 — always check the provider pricing pa
 | **🟡 The free-key tier** | **$0 with a signup.** AISStream, FIRMS, TomTom, OpenSky, plus Cesium ion for eligible personal/non-commercial use. Provider quotas and eligibility still apply. |
 | **🗺️ Google 3D tiles** | **Free through an eligible Cesium ion Community account within its quota; metered through a direct Google key.** Use the direct route for GEV place search or commercial deployment, verify current provider terms, and set budget alerts where billing is enabled. |
 | **🔴 OpenAI voice** | **The one that costs real money — so the app meters it for you.** Realtime audio runs a few cents per active minute; an evening of heavy use is single-digit dollars. A live session-spend readout sits next to the mic, with an STD/MINI model toggle, a $2 warning, and a **$5 hard cap that ends the session**. The voice context window is kept deliberately short too. |
-| **🔴 Gemini voice** | **Metered by Google under the Live API's own pricing.** The app never holds the key in the browser — it mints one-use, short-lived, model-constrained tokens server-side, and token mints are rate-limited per IP. Gemini diagnostics report duration and usage metadata without claiming a dollar cost, and the OpenAI dollar cap does not apply to Gemini sessions. Check [current Live API pricing](https://ai.google.dev/gemini-api/docs/pricing) before relying on it. |
+| **🔴 Gemini voice** | **Metered by Google under the Live API's own pricing.** The app never holds the key in the browser — it mints one-use, short-lived tokens server-side, and token mints are rate-limited per IP. Gemini diagnostics report duration and usage metadata without claiming a dollar cost, and the OpenAI dollar cap does not apply to Gemini sessions. Check [current Live API pricing](https://ai.google.dev/gemini-api/docs/pricing) before relying on it. |
 
 Google's direct 3D route is surprisingly generous: the first 1,000 Photorealistic
 3D Tiles sessions each month are currently free, and one root request supports

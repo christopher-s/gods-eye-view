@@ -105,24 +105,19 @@ function createGeminiLiveTokenHandler({
 
     const { choice, model } = resolvedGeminiModel(requestedChoice(req));
     const now = Date.now();
+    // The live v1beta auth_tokens endpoint accepts ONLY uses and the expiry
+    // windows: it rejects liveConnectConstraints with 400 'Unknown name
+    // liveConnectConstraints at auth_token: Cannot find field' (probed
+    // 2026-09-12, camelCase and snake_case, bare and config-wrapped). The
+    // minted token is therefore unconstrained beyond uses/expiry; the full
+    // session config (instructions, tools) rides the response as setupConfig
+    // for the browser to repeat in its setup message.
     const payload = {
       uses: 1,
       expireTime: new Date(now + GEMINI_TOKEN_LIFETIME_MS).toISOString(),
       newSessionExpireTime: new Date(
         now + GEMINI_NEW_SESSION_WINDOW_MS,
       ).toISOString(),
-      liveConnectConstraints: {
-        model: `models/${model}`,
-        config: {
-          responseModalities: ['AUDIO'],
-          systemInstruction: {
-            parts: [{ text: realtimeInstructions(annotationGuidance) }],
-          },
-          tools: [
-            { functionDeclarations: geminiFunctionDeclarations() },
-          ],
-        },
-      },
     };
 
     try {
@@ -148,6 +143,14 @@ function createGeminiLiveTokenHandler({
         model,
         choice,
         provider: 'gemini',
+        // Session config the browser must repeat in setup: the token can no
+        // longer carry it upstream. Never includes the API key.
+        setupConfig: {
+          systemInstruction: {
+            parts: [{ text: realtimeInstructions(annotationGuidance) }],
+          },
+          tools: [{ functionDeclarations: geminiFunctionDeclarations() }],
+        },
       });
     } catch {
       json(res, 502, { error: 'Failed to create Gemini Live token' });

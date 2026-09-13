@@ -4045,7 +4045,7 @@ test('I2: Gemini get_entity_context attaches the current viewport as inline imag
   }
 
   const imageIndex = socket.sent.findIndex(
-    (message) => message.clientContent?.turns?.[0]?.content?.[0]?.inlineData,
+    (message) => message.clientContent?.turns?.[0]?.parts?.[0]?.inlineData,
   );
   const toolResponseIndex = socket.sent.findIndex((message) => message.toolResponse);
   assert.ok(imageIndex >= 0, 'the viewport image was sent');
@@ -4054,7 +4054,7 @@ test('I2: Gemini get_entity_context attaches the current viewport as inline imag
     'image context reaches Gemini before the tool response triggers follow-up',
   );
   assert.deepEqual(
-    socket.sent[imageIndex].clientContent.turns[0].content[0].inlineData,
+    socket.sent[imageIndex].clientContent.turns[0].parts[0].inlineData,
     { mimeType: 'image/jpeg', data: 'aGVsbG8=' },
   );
   assert.equal(

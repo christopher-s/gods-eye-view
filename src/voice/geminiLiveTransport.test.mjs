@@ -28,11 +28,12 @@ function tokenResponse({
   model = DEFAULT_SERVED_MODEL,
   choice = 'gemini-2.5',
   provider = 'gemini',
+  setupConfig,
 } = {}) {
   return {
     ok: true,
     status: 200,
-    json: async () => ({ token, model, choice, provider }),
+    json: async () => ({ token, model, choice, provider, setupConfig }),
     headers: { get: () => null },
   };
 }
@@ -408,6 +409,30 @@ test('the first message after open is setup with the served model and AUDIO moda
   });
 });
 
+test('setup includes systemInstruction and tools from the token route when the token is unconstrained', async () => {
+  // The live v1beta auth_tokens endpoint rejects liveConnectConstraints, so
+  // the minted token carries no session config; the route response supplies
+  // it and setup MUST repeat it or the session runs without instructions and
+  // tools.
+  const setupConfig = {
+    systemInstruction: { parts: [{ text: 'You are GEV over watch.' }] },
+    tools: [{ functionDeclarations: [{ name: 'fly_to', parameters: {} }] }],
+  };
+  const f = createHarness({
+    fetchImpl: async () => tokenResponse({ setupConfig }),
+  });
+  const socket = await f.connect();
+
+  assert.deepEqual(socket.sent[0], {
+    setup: {
+      model: `models/${DEFAULT_SERVED_MODEL}`,
+      generationConfig: { responseModalities: ['AUDIO'] },
+      systemInstruction: setupConfig.systemInstruction,
+      tools: setupConfig.tools,
+    },
+  });
+});
+
 test('setup carries the server-resolved model, not the browser choice string', async () => {
   const f = createHarness({
     fetchImpl: async () =>
@@ -679,7 +704,7 @@ test('sendText sends a clientContent user turn that completes the turn', async (
   assert.deepEqual(socket.sent.at(-1), {
     clientContent: {
       turns: [
-        { role: 'user', content: [{ text: 'show me flights over Austin' }] },
+        { role: 'user', parts: [{ text: 'show me flights over Austin' }] },
       ],
       turnComplete: true,
     },
@@ -696,9 +721,7 @@ test('sendImage sends inline image data as context without completing a turn', a
       turns: [
         {
           role: 'user',
-          content: [
-            { inlineData: { mimeType: 'image/jpeg', data: 'aGVsbG8=' } },
-          ],
+          parts: [{ inlineData: { mimeType: 'image/jpeg', data: 'aGVsbG8=' } }],
         },
       ],
       turnComplete: false,
