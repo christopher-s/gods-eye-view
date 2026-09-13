@@ -3314,6 +3314,26 @@ test('active diagnostics and tracker identity stay bound while pending selection
   assert.equal(diagnostics.pendingVoiceSelection.choice, 'gemini-3');
 });
 
+test('live OpenAI diagnostics report the server-resolved tracker model', () => {
+  const { controller } = costControllerHarness();
+  const activeSelection = {
+    provider: 'openai', choice: 'standard', label: 'Standard', modelId: 'gpt-realtime-2',
+  };
+  controller.status = 'listening';
+  controller.dc = { readyState: 'open', send() {}, close() {} };
+  controller.activeVoiceSelection = activeSelection;
+  controller.costTracker = createVoiceCostTracker({ modelId: 'gpt-realtime-env-override' });
+  controller.setVoiceProvider('gemini');
+  controller.setVoiceModelChoice('gemini-3');
+
+  const diagnostics = controller.getDiagnostics();
+
+  assert.equal(diagnostics.provider, 'openai');
+  assert.equal(diagnostics.model, 'gpt-realtime-env-override');
+  assert.deepEqual(diagnostics.activeVoiceSelection, activeSelection);
+  assert.equal(diagnostics.pendingVoiceSelection.choice, 'gemini-3');
+});
+
 test('idle Gemini selection displays unavailable cost from construction through limit updates', () => {
   const { controller, ui } = costControllerHarness();
   assert.equal(controller.voiceSelection.provider, 'gemini');
@@ -4079,6 +4099,27 @@ test('Gemini cost is unavailable in diagnostics while OpenAI rates stay untouche
   assert.equal(diagnostics.cost.costAvailable, false);
   assert.equal(diagnostics.cost.totalUsd, 0);
   assert.equal(diagnostics.provider, 'gemini');
+});
+
+test('live Gemini diagnostics report the transport-resolved tracker model', async (t) => {
+  const f = geminiControllerHarness();
+  f.installGlobals(t);
+  f.controller.setVoiceProvider('gemini');
+  await f.controller.start();
+  const activeSelection = { ...f.controller.activeVoiceSelection };
+  f.controller.costTracker = {
+    state: () => ({ modelId: 'gemini-live-env-override' }),
+  };
+  f.controller.setVoiceProvider('openai');
+  f.controller.setVoiceModelChoice('mini');
+
+  const diagnostics = f.controller.getDiagnostics();
+
+  assert.equal(diagnostics.provider, 'gemini');
+  assert.equal(diagnostics.model, 'gemini-live-env-override');
+  assert.deepEqual(diagnostics.activeVoiceSelection, activeSelection);
+  assert.equal(diagnostics.pendingVoiceSelection.provider, 'openai');
+  assert.equal(diagnostics.pendingVoiceSelection.choice, 'mini');
 });
 
 test('provider and model mutations update pending selection without rebinding a live session', () => {

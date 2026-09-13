@@ -125,3 +125,37 @@ Checked 116 adopted files.
 git diff --check
 exit 0
 ```
+
+## Fix Round 2
+
+### RED evidence
+
+Docker Node 24.14.0, with production code unchanged after adding the two live-session regressions:
+
+```text
+docker run --rm -v "$PWD":/app -w /app node:24.14.0 node --test --test-name-pattern='server-resolved|transport-resolved' src/voice/gevRealtime.test.mjs
+2 tests, 0 passed, 2 failed
+```
+
+Both providers returned the registry model from `activeVoiceSelection.modelId` instead of the authoritative served model held by the live cost tracker.
+
+### Fix
+
+- `getDiagnostics()` now snapshots the tracker state once and uses its `modelId` for the live compatibility `model` field.
+- The active provider still comes from `activeVoiceSelection.provider`.
+- Idle diagnostics still return `provider: null` and `model: null`.
+- Active registry choice/label/model metadata and pending selection remain unchanged.
+- Added OpenAI and Gemini regressions covering served-model overrides plus pending-selection changes during the active session.
+
+### GREEN evidence
+
+```text
+docker run --rm -v "$PWD":/app -w /app node:24.14.0 node --test src/voice/gevRealtime.test.mjs src/voice/voiceProviders.test.mjs src/voice/geminiLiveTransport.test.mjs src/voice/voiceCost.test.mjs
+301 tests, 301 passed, 0 failed
+
+npm run format:check
+Checked 116 adopted files.
+
+git diff --check
+exit 0
+```

@@ -2082,10 +2082,11 @@ export class GevRealtimeController {
 
   getDiagnostics() {
     const active = this.activeVoiceSelection;
+    const cost = this.costTracker.state();
     return {
       status: this.status,
       provider: active?.provider || null,
-      model: active?.modelId || null,
+      model: active ? cost.modelId : null,
       pendingVoiceSelection: { ...this.voiceSelection },
       activeVoiceSelection: active ? { ...active } : null,
       connection: this.connectionDiagnostics(),
@@ -2095,7 +2096,7 @@ export class GevRealtimeController {
         file: '.gev-logs/realtime-conversations.jsonl',
         sessionId: this.sessionId,
       },
-      cost: this.costTracker.state(),
+      cost,
     };
   }
 
