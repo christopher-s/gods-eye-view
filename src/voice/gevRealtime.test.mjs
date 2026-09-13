@@ -30,6 +30,7 @@ import {
   readStoredVoiceLimits,
   writeStoredVoiceTier,
   writeStoredVoiceLimits,
+  voiceControlMarkup,
 } from './gevRealtime.js';
 import { createVoiceCostTracker } from './voiceCost.js';
 
@@ -3103,8 +3104,21 @@ const usdUsage = (usd) => ({
 });
 
 /** A controller wired to inert UI stubs, with the cost surface present. */
-function costControllerHarness({ runner } = {}) {
+function costControllerHarness({ runner, withSelectionControls = false } = {}) {
   const toolCalls = [];
+  const createSelect = () => ({
+    tagName: 'SELECT',
+    value: '',
+    options: [],
+    listeners: new Map(),
+    add(option) { this.options.push(option); },
+    replaceChildren() { this.options = []; },
+    addEventListener(type, listener) { this.listeners.set(type, listener); },
+    removeEventListener(type, listener) {
+      if (this.listeners.get(type) === listener) this.listeners.delete(type);
+    },
+    change(value) { this.value = value; this.listeners.get('change')?.({ target: this }); },
+  });
   const ui = {
     root: { dataset: {}, classList: { remove() {}, add() {} }, querySelectorAll: () => [] },
     status: { textContent: '' },
@@ -3120,6 +3134,9 @@ function costControllerHarness({ runner } = {}) {
       getAttribute(key) { return this.attrs[key] ?? null; },
     },
     costValue: { textContent: '', title: '', dataset: {} },
+    providerSelect: withSelectionControls ? createSelect() : null,
+    modelSelect: withSelectionControls ? createSelect() : null,
+    selectionHelp: withSelectionControls ? { textContent: '' } : null,
   };
   const controller = new GevRealtimeController({
     ui,
@@ -3147,9 +3164,51 @@ const fnCallEvent = (name, itemId, callId) => ({
   }),
 });
 
-// ---------------------------------------------------------------------------
-// Provider routing at start() — Gemini Live vs OpenAI Realtime
-// ---------------------------------------------------------------------------
+
+test('MIC panel exposes separate labelled native provider and model selects', () => {
+  const markup = voiceControlMarkup();
+  assert.match(markup, /<label[^>]*for="gev-voice-provider"[^>]*>Provider<\/label>/);
+  assert.match(markup, /<select[^>]*id="gev-voice-provider"[^>]*aria-describedby="gev-voice-selection-help"/);
+  assert.match(markup, /<label[^>]*for="gev-voice-model"[^>]*>Model<\/label>/);
+  assert.match(markup, /<select[^>]*id="gev-voice-model"[^>]*aria-describedby="gev-voice-selection-help"/);
+  assert.match(markup, /id="gev-voice-selection-help"[^>]*>Changes apply to the next session\.<\/span>/);
+});
+
+test('selection controls show exact provider labels and provider-specific models', () => {
+  const { controller, ui } = costControllerHarness({ withSelectionControls: true });
+  controller.syncVoiceSelectionUi();
+  assert.deepEqual(ui.providerSelect.options.map(({ value, textContent }) => ({ value, textContent })), [
+    { value: 'gemini', textContent: 'Gemini Live' },
+    { value: 'openai', textContent: 'OpenAI Realtime' },
+  ]);
+  assert.equal(ui.providerSelect.value, 'gemini');
+  assert.deepEqual(ui.modelSelect.options.map(({ value, textContent }) => ({ value, textContent })), [
+    { value: 'gemini-2.5', textContent: 'Gemini 2.5 Flash Native Audio Dialog' },
+    { value: 'gemini-3', textContent: 'Gemini 3 Flash Live' },
+  ]);
+  assert.equal(ui.modelSelect.value, 'gemini-2.5');
+
+  controller.setVoiceProvider('openai');
+  assert.deepEqual(ui.modelSelect.options.map(({ value, textContent }) => ({ value, textContent })), [
+    { value: 'standard', textContent: 'Standard' },
+    { value: 'mini', textContent: 'Mini' },
+  ]);
+});
+
+test('native select changes use controller setters and preserve the active session selection', () => {
+  const { controller, ui } = costControllerHarness({ withSelectionControls: true });
+  controller.activeVoiceSelection = {
+    provider: 'openai', choice: 'standard', label: 'Standard', modelId: 'gpt-realtime-2',
+  };
+  controller.bindVoiceSelectionControls();
+  ui.providerSelect.change('gemini');
+  ui.modelSelect.change('gemini-3');
+  assert.equal(controller.voiceSelection.provider, 'gemini');
+  assert.equal(controller.voiceSelection.choice, 'gemini-3');
+  assert.equal(controller.activeVoiceSelection.provider, 'openai');
+  assert.equal(controller.activeVoiceSelection.choice, 'standard');
+});
+
 
 /**
  * Controller + fake Gemini transport factory. Captures the callbacks the

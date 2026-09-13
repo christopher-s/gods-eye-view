@@ -10,8 +10,10 @@ import {
   serializeCostLimits,
 } from './voiceCost.js';
 import {
+  modelsForProvider,
   readStoredVoiceSelection,
   resolveVoiceProvider,
+  VOICE_PROVIDERS,
   writeStoredVoiceSelection,
 } from './voiceProviders.js';
 import {
@@ -229,6 +231,8 @@ export function initGevVoiceCommands({ viewer, styleManager, dataManager, sceneD
     controller.tierHandler = () => controller.toggleVoiceTier();
     ui.tierButton.addEventListener('click', controller.tierHandler);
   }
+  controller.bindVoiceSelectionControls();
+  controller.syncVoiceSelectionUi();
   controller.syncCostUi();
   controller.bindPushToTalkShortcut();
   window.__gevVoiceCommands = controller;
@@ -277,6 +281,8 @@ export class GevRealtimeController {
     this.radioHandoffDeferredByReservation = false;
     this.buttonHandler = null;
     this.tierHandler = null;
+    this.providerHandler = null;
+    this.modelHandler = null;
     this.annotationEventUnsubscribe = null;
     // Active Gemini Live transport (null while idle / on OpenAI). The OpenAI
     // path keeps its pc/dc fields; Gemini owns everything behind this handle.
@@ -289,6 +295,7 @@ export class GevRealtimeController {
     // connected with — the toggle is labelled "applies next session" for that
     // reason. Limits are read once here and re-read at each start().
     this.voiceSelection = readStoredVoiceSelection();
+    this.activeVoiceSelection = null;
     this.voiceTier = this.voiceSelection.provider === 'openai'
       ? this.voiceSelection.choice
       : readStoredVoiceTier();
@@ -375,6 +382,7 @@ export class GevRealtimeController {
     // while the last session ran (or in another tab) takes effect exactly here
     // — this is what "applies next session" means.
     this.voiceSelection = readStoredVoiceSelection();
+    this.activeVoiceSelection = this.voiceSelection;
     if (this.voiceSelection.provider === 'openai') {
       this.voiceTier = this.voiceSelection.choice;
     } else {
@@ -1174,6 +1182,14 @@ export class GevRealtimeController {
       this.ui.tierButton.removeEventListener('click', this.tierHandler);
       this.tierHandler = null;
     }
+    if (removeUi && this.ui?.providerSelect && this.providerHandler) {
+      this.ui.providerSelect.removeEventListener('change', this.providerHandler);
+      this.providerHandler = null;
+    }
+    if (removeUi && this.ui?.modelSelect && this.modelHandler) {
+      this.ui.modelSelect.removeEventListener('change', this.modelHandler);
+      this.modelHandler = null;
+    }
     if (removeUi) {
       if (this.shortcutKeyDownHandler) document.removeEventListener('keydown', this.shortcutKeyDownHandler, true);
       if (this.shortcutKeyUpHandler) document.removeEventListener('keyup', this.shortcutKeyUpHandler, true);
@@ -1208,6 +1224,8 @@ export class GevRealtimeController {
       this.ui.root.remove();
     }
     if (!preserveStatus && !removeUi) {
+      this.activeVoiceSelection = null;
+      this.syncVoiceSelectionUi();
       this.setStatus('idle', 'Voice off');
     }
     this.setRadioVoiceDucking(false);
@@ -2068,7 +2086,10 @@ export class GevRealtimeController {
   getDiagnostics() {
     return {
       status: this.status,
-      provider: this.voiceSelection?.provider || 'openai',
+      provider: this.activeVoiceSelection?.provider || this.voiceSelection?.provider || 'openai',
+      model: this.activeVoiceSelection?.modelId || this.costTracker.state().modelId,
+      pendingVoiceSelection: { ...this.voiceSelection },
+      activeVoiceSelection: this.activeVoiceSelection ? { ...this.activeVoiceSelection } : null,
       connection: this.connectionDiagnostics(),
       recentErrors: this.errors.slice(),
       debugLog: {
@@ -2204,6 +2225,51 @@ export class GevRealtimeController {
     return this.voiceTier;
   }
 
+  /** Bind native-select changes to pending controller state. */
+  bindVoiceSelectionControls() {
+    if (this.ui?.providerSelect && !this.providerHandler) {
+      this.providerHandler = (event) => this.setVoiceProvider(event.target.value);
+      this.ui.providerSelect.addEventListener('change', this.providerHandler);
+    }
+    if (this.ui?.modelSelect && !this.modelHandler) {
+      this.modelHandler = (event) => this.setVoiceModelChoice(event.target.value);
+      this.ui.modelSelect.addEventListener('change', this.modelHandler);
+    }
+  }
+
+  /** Paint approved provider/model options from the registry. */
+  syncVoiceSelectionUi() {
+    const pending = this.voiceSelection || readStoredVoiceSelection();
+    if (this.ui?.providerSelect) {
+      this.ui.providerSelect.replaceChildren();
+      for (const provider of Object.values(VOICE_PROVIDERS)) {
+        const option = typeof Option === 'function'
+          ? new Option(provider.label, provider.provider)
+          : { textContent: provider.label, value: provider.provider };
+        this.ui.providerSelect.add(option);
+      }
+      this.ui.providerSelect.value = pending.provider;
+    }
+    if (this.ui?.modelSelect) {
+      this.ui.modelSelect.replaceChildren();
+      for (const model of modelsForProvider(pending.provider)) {
+        const option = typeof Option === 'function'
+          ? new Option(model.label, model.choice)
+          : { textContent: model.label, value: model.choice };
+        this.ui.modelSelect.add(option);
+      }
+      this.ui.modelSelect.value = pending.choice;
+    }
+    if (this.ui?.selectionHelp) {
+      const active = this.activeVoiceSelection;
+      this.ui.selectionHelp.textContent = active && (
+        active.provider !== pending.provider || active.choice !== pending.choice
+      )
+        ? `Active: ${resolveVoiceProvider(active.provider).label} — ${active.label}. Next: ${resolveVoiceProvider(pending.provider).label} — ${pending.label}.`
+        : `Next session: ${resolveVoiceProvider(pending.provider).label} — ${pending.label}.`;
+    }
+  }
+
   /** Set the provider used by the next session, preserving its stored model choice. */
   setVoiceProvider(provider) {
     const resolvedProvider = resolveVoiceProvider(provider).provider;
@@ -2229,10 +2295,8 @@ export class GevRealtimeController {
         limits: this.voiceLimits,
       });
     }
+    this.syncVoiceSelectionUi();
     this.syncCostUi();
-    if (this.isActive() && this.ui?.detail) {
-      this.setStatus(this.status, `${this.voiceSelection.label} applies next session`);
-    }
   }
 
   /**
@@ -3017,25 +3081,22 @@ function resetVoiceVisualizerBars(bars) {
   }
 }
 
-function createVoiceControl({ reset = false } = {}) {
-  let root = document.getElementById('gev-voice-control');
-  if (root && reset) {
-    root.remove();
-    root = null;
-  }
-  if (!root) {
-    root = document.createElement('div');
-    root.id = 'gev-voice-control';
-    root.dataset.status = 'idle';
-    root.dataset.speaker = 'idle';
-    root.innerHTML = `
+export function voiceControlMarkup() {
+  return `
       <div class="gev-voice-heading">
         <div class="gev-voice-kicker">AI AGENT</div>
         <div id="gev-voice-status">OFF</div>
         <div class="gev-voice-cost">
-          <button id="gev-voice-tier" class="gev-voice-tier-btn" type="button" aria-pressed="false" title="Voice model tier — applies next session">STD</button>
-          <span id="gev-voice-cost-value" class="gev-voice-cost-value" data-level="ok" title="Estimated session cost">~$0.00</span>
+          <button id="gev-voice-tier" class="gev-voice-tier-btn" type="button" aria-pressed="false" title="OpenAI model compatibility control — applies next session">STD</button>
+          <span id="gev-voice-cost-value" class="gev-voice-cost-value" data-level="ok" title="Session usage">~$0.00</span>
         </div>
+      </div>
+      <div class="gev-voice-selection" aria-label="Voice session settings">
+        <label for="gev-voice-provider">Provider</label>
+        <select id="gev-voice-provider" aria-describedby="gev-voice-selection-help"></select>
+        <label for="gev-voice-model">Model</label>
+        <select id="gev-voice-model" aria-describedby="gev-voice-selection-help"></select>
+        <span id="gev-voice-selection-help">Changes apply to the next session.</span>
       </div>
       <button id="gev-voice-button" type="button" aria-label="Voice control — activate to toggle voice; hold Space to speak" aria-describedby="gev-voice-help">
         <span class="gev-mic-orbit"><img src="/mic.svg" alt="" /></span>
@@ -3059,7 +3120,21 @@ function createVoiceControl({ reset = false } = {}) {
         <div id="gev-voice-error-detail"></div>
         <div class="gev-voice-error-hint">Check microphone permission and network access, then try again.</div>
       </div>
-    `;
+  `;
+}
+
+function createVoiceControl({ reset = false } = {}) {
+  let root = document.getElementById('gev-voice-control');
+  if (root && reset) {
+    root.remove();
+    root = null;
+  }
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'gev-voice-control';
+    root.dataset.status = 'idle';
+    root.dataset.speaker = 'idle';
+    root.innerHTML = voiceControlMarkup();
     const commandDock = document.getElementById('command-dock');
     if (commandDock) {
       const locationBar = document.getElementById('location-bar');
@@ -3084,5 +3159,8 @@ function createVoiceControl({ reset = false } = {}) {
     errorDetail: root.querySelector('#gev-voice-error-detail'),
     tierButton: root.querySelector('#gev-voice-tier'),
     costValue: root.querySelector('#gev-voice-cost-value'),
+    providerSelect: root.querySelector('#gev-voice-provider'),
+    modelSelect: root.querySelector('#gev-voice-model'),
+    selectionHelp: root.querySelector('#gev-voice-selection-help'),
   };
 }
