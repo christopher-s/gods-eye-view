@@ -300,10 +300,7 @@ export class GevRealtimeController {
       ? this.voiceSelection.choice
       : readStoredVoiceTier();
     this.voiceLimits = readStoredVoiceLimits();
-    this.costTracker = createVoiceCostTracker({
-      tier: this.voiceTier,
-      limits: this.voiceLimits,
-    });
+    this.costTracker = this.createPendingVoiceCostTracker();
     this.costCapStopped = false;
     this.radioControlUnsubscribe = this.radioLayer?.subscribePlaybackControls?.((control) => {
       const event = typeof control === 'string'
@@ -2084,12 +2081,13 @@ export class GevRealtimeController {
   }
 
   getDiagnostics() {
+    const active = this.activeVoiceSelection;
     return {
       status: this.status,
-      provider: this.activeVoiceSelection?.provider || this.voiceSelection?.provider || 'openai',
-      model: this.activeVoiceSelection?.modelId || this.costTracker.state().modelId,
+      provider: active?.provider || null,
+      model: active?.modelId || null,
       pendingVoiceSelection: { ...this.voiceSelection },
-      activeVoiceSelection: this.activeVoiceSelection ? { ...this.activeVoiceSelection } : null,
+      activeVoiceSelection: active ? { ...active } : null,
       connection: this.connectionDiagnostics(),
       recentErrors: this.errors.slice(),
       debugLog: {
@@ -2225,6 +2223,20 @@ export class GevRealtimeController {
     return this.voiceTier;
   }
 
+  /** Build the idle preview tracker from the pending provider/model. */
+  createPendingVoiceCostTracker() {
+    if (this.voiceSelection?.provider === 'gemini') {
+      return createGeminiVoiceCostTracker({
+        modelId: this.voiceSelection.modelId,
+        limits: this.voiceLimits,
+      });
+    }
+    return createVoiceCostTracker({
+      tier: this.voiceSelection?.choice || this.voiceTier,
+      limits: this.voiceLimits,
+    });
+  }
+
   /** Bind native-select changes to pending controller state. */
   bindVoiceSelectionControls() {
     if (this.ui?.providerSelect && !this.providerHandler) {
@@ -2262,11 +2274,12 @@ export class GevRealtimeController {
     }
     if (this.ui?.selectionHelp) {
       const active = this.activeVoiceSelection;
-      this.ui.selectionHelp.textContent = active && (
-        active.provider !== pending.provider || active.choice !== pending.choice
-      )
-        ? `Active: ${resolveVoiceProvider(active.provider).label} — ${active.label}. Next: ${resolveVoiceProvider(pending.provider).label} — ${pending.label}.`
-        : `Next session: ${resolveVoiceProvider(pending.provider).label} — ${pending.label}.`;
+      const pendingDescription = `${resolveVoiceProvider(pending.provider).label} · ${pending.label}`;
+      const activeDescription = active
+        ? `${resolveVoiceProvider(active.provider).label} · ${active.label}`
+        : 'Off';
+      this.ui.selectionHelp.textContent =
+        `Active: ${activeDescription}. Next session: ${pendingDescription}.`;
     }
   }
 
@@ -2289,11 +2302,8 @@ export class GevRealtimeController {
   }
 
   syncPendingVoiceSelection() {
-    if (this.isVoiceSessionSettled() && this.voiceSelection.provider === 'openai') {
-      this.costTracker = createVoiceCostTracker({
-        tier: this.voiceSelection.choice,
-        limits: this.voiceLimits,
-      });
+    if (this.isVoiceSessionSettled()) {
+      this.costTracker = this.createPendingVoiceCostTracker();
     }
     this.syncVoiceSelectionUi();
     this.syncCostUi();
@@ -2309,10 +2319,7 @@ export class GevRealtimeController {
   setVoiceCostLimits(limits) {
     this.voiceLimits = writeStoredVoiceLimits(limits);
     if (this.isVoiceSessionSettled()) {
-      this.costTracker = createVoiceCostTracker({
-        tier: this.voiceTier,
-        limits: this.voiceLimits,
-      });
+      this.costTracker = this.createPendingVoiceCostTracker();
     }
     this.syncCostUi();
     return this.voiceLimits;

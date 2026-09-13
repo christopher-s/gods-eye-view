@@ -3113,14 +3113,19 @@ function costControllerHarness({ runner, withSelectionControls = false } = {}) {
     listeners: new Map(),
     add(option) { this.options.push(option); },
     replaceChildren() { this.options = []; },
-    addEventListener(type, listener) { this.listeners.set(type, listener); },
-    removeEventListener(type, listener) {
-      if (this.listeners.get(type) === listener) this.listeners.delete(type);
+    addEventListener(type, listener) {
+      if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+      this.listeners.get(type).add(listener);
     },
-    change(value) { this.value = value; this.listeners.get('change')?.({ target: this }); },
+    removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); },
+    listenerCount(type) { return this.listeners.get(type)?.size || 0; },
+    change(value) {
+      this.value = value;
+      for (const listener of this.listeners.get('change') || []) listener({ target: this });
+    },
   });
   const ui = {
-    root: { dataset: {}, classList: { remove() {}, add() {} }, querySelectorAll: () => [] },
+    root: { dataset: {}, classList: { remove() {}, add() {} }, querySelectorAll: () => [], remove() {} },
     status: { textContent: '' },
     detail: { textContent: '', title: '' },
     errorDetail: { textContent: '' },
@@ -3207,6 +3212,123 @@ test('native select changes use controller setters and preserve the active sessi
   assert.equal(controller.voiceSelection.choice, 'gemini-3');
   assert.equal(controller.activeVoiceSelection.provider, 'openai');
   assert.equal(controller.activeVoiceSelection.choice, 'standard');
+});
+
+test('selector wiring restores each provider stored model through real change handlers', (t) => {
+  const priorStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: fakeVoiceStorage(),
+  });
+  t.after(() => {
+    if (priorStorage) Object.defineProperty(globalThis, 'localStorage', priorStorage);
+    else delete globalThis.localStorage;
+  });
+  const { controller, ui } = costControllerHarness({ withSelectionControls: true });
+  controller.bindVoiceSelectionControls();
+  ui.providerSelect.change('openai');
+  ui.modelSelect.change('mini');
+  ui.providerSelect.change('gemini');
+  ui.modelSelect.change('gemini-3');
+  ui.providerSelect.change('openai');
+  assert.equal(ui.modelSelect.value, 'mini');
+  ui.providerSelect.change('gemini');
+  assert.equal(ui.modelSelect.value, 'gemini-3');
+});
+
+test('hostile selector values fall back coherently through UI synchronization', () => {
+  const { controller, ui } = costControllerHarness({ withSelectionControls: true });
+  controller.bindVoiceSelectionControls();
+  ui.providerSelect.change('__proto__');
+  assert.equal(controller.voiceSelection.provider, 'gemini');
+  assert.equal(ui.providerSelect.value, 'gemini');
+  assert.equal(ui.modelSelect.value, 'gemini-2.5');
+  ui.modelSelect.change('constructor');
+  assert.equal(controller.voiceSelection.choice, 'gemini-2.5');
+  assert.equal(ui.modelSelect.value, 'gemini-2.5');
+});
+
+test('selection listener teardown prevents duplicate handlers on replacement initialization', () => {
+  const first = costControllerHarness({ withSelectionControls: true });
+  first.controller.bindVoiceSelectionControls();
+  first.controller.bindVoiceSelectionControls();
+  assert.equal(first.ui.providerSelect.listenerCount('change'), 1);
+  assert.equal(first.ui.modelSelect.listenerCount('change'), 1);
+  first.controller.stop({ removeUi: true });
+  assert.equal(first.ui.providerSelect.listenerCount('change'), 0);
+  assert.equal(first.ui.modelSelect.listenerCount('change'), 0);
+  const replacement = costControllerHarness({ withSelectionControls: true });
+  replacement.controller.bindVoiceSelectionControls();
+  assert.equal(replacement.ui.providerSelect.listenerCount('change'), 1);
+  assert.equal(replacement.ui.modelSelect.listenerCount('change'), 1);
+});
+
+test('idle selection help separates Active Off from the pending next session', () => {
+  const { controller, ui } = costControllerHarness({ withSelectionControls: true });
+  controller.setVoiceProvider('gemini');
+  controller.setVoiceModelChoice('gemini-3');
+  assert.equal(ui.selectionHelp.textContent, 'Active: Off. Next session: Gemini Live · Gemini 3 Flash Live.');
+});
+
+test('active selection help always names active and pending selections separately', () => {
+  const { controller, ui } = costControllerHarness({ withSelectionControls: true });
+  controller.activeVoiceSelection = {
+    provider: 'openai', choice: 'standard', label: 'Standard', modelId: 'gpt-realtime-2',
+  };
+  controller.setVoiceProvider('gemini');
+  controller.setVoiceModelChoice('gemini-3');
+  assert.equal(ui.selectionHelp.textContent, 'Active: OpenAI Realtime · Standard. Next session: Gemini Live · Gemini 3 Flash Live.');
+});
+
+test('idle diagnostics use null active compatibility fields and retain pending selection', () => {
+  const { controller } = costControllerHarness();
+  controller.setVoiceProvider('gemini');
+  controller.setVoiceModelChoice('gemini-3');
+  const diagnostics = controller.getDiagnostics();
+  assert.equal(diagnostics.provider, null);
+  assert.equal(diagnostics.model, null);
+  assert.equal(diagnostics.activeVoiceSelection, null);
+  assert.deepEqual(diagnostics.pendingVoiceSelection, controller.voiceSelection);
+  assert.equal(diagnostics.cost.modelId, 'gemini-3.1-flash-live-preview');
+});
+
+test('active diagnostics and tracker identity stay bound while pending selection changes', () => {
+  const { controller } = costControllerHarness();
+  const activeSelection = {
+    provider: 'openai', choice: 'standard', label: 'Standard', modelId: 'gpt-realtime-2',
+  };
+  const tracker = createVoiceCostTracker({ modelId: activeSelection.modelId });
+  const transport = { readyState: 'open', send() {}, close() {} };
+  controller.status = 'listening';
+  controller.dc = transport;
+  controller.activeVoiceSelection = activeSelection;
+  controller.costTracker = tracker;
+  controller.setVoiceProvider('gemini');
+  controller.setVoiceModelChoice('gemini-3');
+  const diagnostics = controller.getDiagnostics();
+  assert.equal(controller.dc, transport);
+  assert.equal(controller.costTracker, tracker);
+  assert.equal(diagnostics.provider, 'openai');
+  assert.equal(diagnostics.model, 'gpt-realtime-2');
+  assert.deepEqual(diagnostics.activeVoiceSelection, activeSelection);
+  assert.equal(diagnostics.pendingVoiceSelection.choice, 'gemini-3');
+});
+
+test('idle Gemini selection displays unavailable cost from construction through limit updates', () => {
+  const { controller, ui } = costControllerHarness();
+  assert.equal(controller.voiceSelection.provider, 'gemini');
+  controller.syncCostUi();
+  assert.equal(controller.costTracker.state().costAvailable, false);
+  assert.equal(ui.costValue.textContent, 'N/A');
+  controller.setVoiceProvider('openai');
+  assert.notEqual(controller.costTracker.state().costAvailable, false);
+  controller.setVoiceProvider('gemini');
+  assert.equal(controller.costTracker.state().costAvailable, false);
+  assert.equal(ui.costValue.textContent, 'N/A');
+  controller.setVoiceCostLimits({ warnUsd: 1, capUsd: 3 });
+  assert.equal(controller.costTracker.state().costAvailable, false);
+  assert.equal(ui.costValue.textContent, 'N/A');
+  assert.doesNotMatch(ui.costValue.title, /Estimated session cost|\$/i);
 });
 
 
