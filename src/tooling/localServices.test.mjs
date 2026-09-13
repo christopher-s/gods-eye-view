@@ -229,6 +229,187 @@ test('Gemini declarations retain only the supported function fields', () => {
   );
 });
 
+test('Gemini declarations strip unsupported JSON-Schema keywords at every nesting level', () => {
+  const [declaration] = geminiFunctionDeclarations([
+    {
+      type: 'function',
+      name: 'fixture_nested_tool',
+      description: 'Fixture description',
+      parameters: {
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        type: 'object',
+        additionalProperties: false,
+        unevaluatedProperties: false,
+        patternProperties: { '^x-': { type: 'string' } },
+        propertyNames: { pattern: '^[a-z]+$' },
+        examples: [{ mode: 'a' }],
+        default: { mode: 'a' },
+        properties: {
+          mode: {
+            type: 'string',
+            enum: ['a', 'b'],
+            example: 'a',
+          },
+          nested: {
+            type: 'object',
+            additionalProperties: false,
+            patternProperties: { '^deep-': { type: 'number' } },
+            properties: {
+              deep: {
+                type: 'object',
+                additionalProperties: false,
+                default: { deep: true },
+                examples: [{ deep: true }],
+                properties: { ok: { type: 'boolean' } },
+              },
+            },
+          },
+          list: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              additionalItems: { type: 'string' },
+              properties: { id: { type: 'string' } },
+            },
+          },
+        },
+        required: ['mode'],
+      },
+    },
+  ]);
+  const serialized = JSON.stringify(declaration);
+  for (const banned of [
+    '$schema',
+    'additionalProperties',
+    'additionalItems',
+    'patternProperties',
+    'propertyNames',
+    'unevaluatedProperties',
+    'examples',
+    'example',
+    'default',
+  ]) {
+    assert.equal(
+      serialized.includes(`"${banned}"`),
+      false,
+      `unsupported keyword "${banned}" survived sanitization`,
+    );
+  }
+  assert.deepEqual(
+    declaration.parameters.properties.nested.properties.deep.properties,
+    { ok: { type: 'boolean' } },
+  );
+  assert.deepEqual(declaration.parameters.properties.list.items.properties, {
+    id: { type: 'string' },
+  });
+});
+
+test('Gemini declarations keep the supported OpenAPI subset through nesting', () => {
+  const [declaration] = geminiFunctionDeclarations([
+    {
+      type: 'function',
+      name: 'fixture_subset_tool',
+      description: 'Fixture description',
+      parameters: {
+        type: 'object',
+        title: 'Fixture subset',
+        description: 'Top-level description.',
+        properties: {
+          count: {
+            type: 'integer',
+            format: 'int32',
+            minimum: 0,
+            maximum: 100,
+          },
+          label: {
+            type: 'string',
+            title: 'Label',
+            description: 'A label.',
+            minLength: 1,
+            maxLength: 40,
+            pattern: '^\\w+$',
+          },
+          mode: { type: 'string', enum: ['fast', 'slow'] },
+          maybe: { type: 'string', nullable: true },
+          custom: { type: 'string', format: 'custom-format' },
+          order: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 9,
+            items: { type: 'string' },
+          },
+          choice: {
+            anyOf: [{ type: 'string', enum: ['x'] }, { type: 'number' }],
+          },
+        },
+        required: ['count', 'label'],
+        propertyOrdering: ['count', 'label'],
+      },
+    },
+  ]);
+  assert.deepEqual(declaration.parameters, {
+    type: 'object',
+    title: 'Fixture subset',
+    description: 'Top-level description.',
+    properties: {
+      count: { type: 'integer', format: 'int32', minimum: 0, maximum: 100 },
+      label: {
+        type: 'string',
+        title: 'Label',
+        description: 'A label.',
+        minLength: 1,
+        maxLength: 40,
+        pattern: '^\\w+$',
+      },
+      mode: { type: 'string', enum: ['fast', 'slow'] },
+      maybe: { type: 'string', nullable: true },
+      custom: { type: 'string' },
+      order: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 9,
+        items: { type: 'string' },
+      },
+      choice: {
+        anyOf: [{ type: 'string', enum: ['x'] }, { type: 'number' }],
+      },
+    },
+    required: ['count', 'label'],
+    propertyOrdering: ['count', 'label'],
+  });
+});
+
+test('Gemini declarations do not mutate or alias the OpenAI originals', () => {
+  const snapshot = JSON.parse(JSON.stringify(GEV_REALTIME_TOOLS));
+  const declarations = geminiFunctionDeclarations();
+
+  // The canonical OpenAI definitions keep every JSON-Schema keyword.
+  assert.deepEqual(GEV_REALTIME_TOOLS, snapshot);
+  assert.ok(
+    GEV_REALTIME_TOOLS.every(
+      (tool) => tool.parameters.additionalProperties === false,
+    ),
+  );
+
+  // Hostile deep mutation of the sanitized output cannot reach the originals.
+  const flyTo = declarations.find((tool) => tool.name === 'fly_to_location');
+  flyTo.parameters.properties.locationId.enum.push('mutated');
+  flyTo.parameters.properties.query.description = 'mutated';
+  flyTo.parameters.required = ['mutated'];
+  assert.deepEqual(GEV_REALTIME_TOOLS, snapshot);
+});
+
+test('Gemini declarations sanitize the real GEV_REALTIME_TOOLS payload', () => {
+  const serialized = JSON.stringify(geminiFunctionDeclarations());
+  assert.equal(serialized.includes('additionalProperties'), false);
+  assert.equal(serialized.includes('"strict"'), false);
+  assert.ok(serialized.includes('"enum"'));
+  assert.ok(serialized.includes('"required"'));
+  assert.ok(serialized.includes('"items"'));
+  assert.ok(serialized.includes('"description"'));
+});
+
 test('Gemini token handler is POST-only and requires a server key', async (t) => {
   env(t, 'GEMINI_API_KEY', undefined);
   const handler = createGeminiLiveTokenHandler();
