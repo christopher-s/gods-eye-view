@@ -4,12 +4,9 @@ import WebSocket from 'ws';
 
 const ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
 const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_CLOSE_GRACE_MS = 5_000;
 const DEFAULT_MODEL_CHOICE = 'gemini-2.5';
 const PROMPT = 'Reply with one very short spoken sentence, under five seconds.';
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 export function redactSecrets(value, knownSecrets = []) {
   let output = String(value ?? '');
@@ -25,6 +22,11 @@ export function redactSecrets(value, knownSecrets = []) {
   return output;
 }
 
+/**
+ * Acceptance contract: setupComplete plus audio OR a substantive model response
+ * (non-empty parts or a tool call). A bare turnComplete with no payload is not
+ * evidence the model replied, so it can never pass on its own.
+ */
 export function protocolAcceptance(messages) {
   let setupComplete = false;
   let audio = false;
@@ -33,9 +35,14 @@ export function protocolAcceptance(messages) {
     if (message?.setupComplete !== undefined) setupComplete = true;
     const content = message?.serverContent;
     const parts = content?.modelTurn?.parts || [];
-    if (parts.length || content?.turnComplete === true || message?.toolCall?.functionCalls?.length) {
-      validModelResponse = true;
-    }
+    const hasSubstantivePart = parts.some((part) => (
+      (typeof part?.text === 'string' && part.text.trim())
+      || (typeof part?.inlineData?.data === 'string' && part.inlineData.data)
+      || part?.functionCall
+      || part?.functionResponse
+    ));
+    const hasToolCall = Boolean(message?.toolCall?.functionCalls?.length);
+    if (hasSubstantivePart || hasToolCall) validModelResponse = true;
     if (parts.some((part) => typeof part?.inlineData?.data === 'string' && /^audio\//i.test(part?.inlineData?.mimeType || ''))) {
       audio = true;
     }
@@ -78,12 +85,27 @@ export async function createGeminiLiveSmoke({
   if (!['http:', 'https:'].includes(parsedBase.protocol)) throw new Error('Base URL must use http or https');
   const tokenUrl = new URL('/api/gemini-live/token', parsedBase);
   tokenUrl.searchParams.set('model', modelChoice);
+
   const secrets = [];
   let socket;
-  let timer;
+  let graceTimer;
+  const controller = new AbortController();
+  let rejectDeadline;
+  const deadline = new Promise((_, reject) => { rejectDeadline = reject; });
+  // One overall deadline: it starts before the token fetch and socket
+  // construction and covers handshake, setup, the response turn, and closure.
+  const timer = setTimeout(() => {
+    controller.abort();
+    rejectDeadline(new Error(`Gemini Live smoke timed out after ${timeoutMs}ms (whole operation)`));
+  }, timeoutMs);
+
   try {
-    const response = await fetchImpl(tokenUrl.href, { method: 'POST', cache: 'no-store' });
-    const body = await response.json().catch(() => null);
+    // ── Stage 1: mint an ephemeral token under the overall deadline ──
+    const response = await Promise.race([
+      fetchImpl(tokenUrl.href, { method: 'POST', cache: 'no-store', signal: controller.signal }),
+      deadline,
+    ]);
+    const body = await Promise.race([response.json().catch(() => null), deadline]);
     if (!response.ok) throw new Error(typeof body?.error === 'string' ? body.error : `Token route returned HTTP ${response.status}`);
     if (body?.provider !== undefined && body.provider !== 'gemini') throw new Error('Token route returned a non-Gemini provider');
     if (typeof body?.token !== 'string' || !body.token) throw new Error('Token route returned no token');
@@ -91,46 +113,105 @@ export async function createGeminiLiveSmoke({
     const model = typeof body.model === 'string' && body.model ? body.model : null;
     if (!model) throw new Error('Token route returned no model');
 
+    // ── Stage 2: constrained WebSocket handshake under the same deadline ──
     const messages = [];
-    const wsUrl = `${ENDPOINT}?access_token=${encodeURIComponent(body.token)}`;
-    socket = new WebSocketClass(wsUrl);
-    await new Promise((resolve, reject) => {
-      const fail = (error) => reject(error instanceof Error ? error : new Error('WebSocket failed before opening'));
-      const close = (event) => reject(new Error(`WebSocket closed before opening (code ${event?.code ?? 'unknown'})`));
-      const open = () => { socketOff(socket, 'error', fail); socketOff(socket, 'close', close); resolve(); };
-      socketOn(socket, 'error', fail);
-      socketOn(socket, 'close', close);
-      socketOn(socket, 'open', open);
+    let fatal = null;
+    let closeEvent = null;
+    let activeWaiter = null;
+    const pump = () => {
+      const waiter = activeWaiter;
+      if (!waiter) return;
+      if (fatal) {
+        activeWaiter = null;
+        waiter.reject(fatal);
+        return;
+      }
+      if (closeEvent) {
+        activeWaiter = null;
+        if (waiter.expectClose) waiter.resolve(closeEvent);
+        else {
+          const reason = closeEvent?.reason ? `, reason "${closeEvent.reason}"` : '';
+          waiter.reject(new Error(`Gemini Live WebSocket closed before ${waiter.stage} (code ${closeEvent?.code ?? 'unknown'}${reason})`));
+        }
+        return;
+      }
+      const value = waiter.test();
+      if (value) {
+        activeWaiter = null;
+        waiter.resolve(value);
+      }
+    };
+    const waitFor = (stage, test, expectClose = false) => new Promise((resolve, reject) => {
+      activeWaiter = { stage, test, expectClose, resolve, reject };
+      pump();
     });
 
-    const accepted = await new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error(`Gemini Live smoke timed out after ${timeoutMs}ms`)), timeoutMs);
-      const finish = () => {
-        const state = protocolAcceptance(messages);
-        if (state.ok) { clearTimeout(timer); resolve(state); }
-      };
-      socketOn(socket, 'error', (error) => reject(error instanceof Error ? error : new Error('Gemini Live WebSocket error')));
-      socketOn(socket, 'close', (event) => {
-        const state = protocolAcceptance(messages);
-        if (state.ok) resolve(state);
-        else reject(new Error(`Gemini Live WebSocket closed before a valid response (code ${event?.code ?? 'unknown'})`));
-      });
-      socketOn(socket, 'message', (event) => {
-        const message = parseMessage(event?.data ?? event);
-        if (!message) return;
-        messages.push(message);
-        finish();
-      });
-      socket.send(JSON.stringify({ setup: { model: `models/${model}`, generationConfig: { responseModalities: ['AUDIO'] } } }));
-      socket.send(JSON.stringify({ clientContent: { turns: [{ role: 'user', content: [{ text: PROMPT }] }], turnComplete: true } }));
+    socket = new WebSocketClass(`${ENDPOINT}?access_token=${encodeURIComponent(body.token)}`);
+    await Promise.race([
+      new Promise((resolve, reject) => {
+        const fail = (error) => reject(error instanceof Error ? error : new Error('Gemini Live WebSocket failed before opening'));
+        const refused = (event) => reject(new Error(`Gemini Live WebSocket closed before opening (code ${event?.code ?? 'unknown'})`));
+        const open = () => { socketOff(socket, 'error', fail); socketOff(socket, 'close', refused); resolve(); };
+        socketOn(socket, 'error', fail);
+        socketOn(socket, 'close', refused);
+        socketOn(socket, 'open', open);
+      }),
+      deadline,
+    ]);
+
+    socketOn(socket, 'message', (event) => {
+      const message = parseMessage(event?.data ?? event);
+      if (!message) return;
+      messages.push(message);
+      pump();
+    });
+    socketOn(socket, 'error', (error) => {
+      fatal = fatal || (error instanceof Error ? error : new Error('Gemini Live WebSocket error'));
+      pump();
+    });
+    socketOn(socket, 'close', (event) => {
+      closeEvent = event || { code: null };
+      pump();
     });
 
-    if (socket?.readyState === (WebSocketClass.OPEN ?? 1)) socket.close(1000, 'qa-complete');
+    // ── Stage 3: setup first; clientContent waits for the acknowledgement ──
+    socket.send(JSON.stringify({ setup: { model: `models/${model}`, generationConfig: { responseModalities: ['AUDIO'] } } }));
+    await Promise.race([
+      waitFor('setup acknowledgement', () => (messages.some((message) => message?.setupComplete !== undefined) ? true : null)),
+      deadline,
+    ]);
+
+    // ── Stage 4: bounded text turn under the same deadline ──
+    if (socket.readyState === 3) {
+      throw new Error(`Gemini Live WebSocket closed before the text turn (code ${closeEvent?.code ?? 'unknown'})`);
+    }
+    socket.send(JSON.stringify({ clientContent: { turns: [{ role: 'user', content: [{ text: PROMPT }] }], turnComplete: true } }));
+    const accepted = await Promise.race([
+      waitFor('a valid model response', () => {
+        const state = protocolAcceptance(messages);
+        return state.ok ? state : null;
+      }),
+      deadline,
+    ]);
+
+    // ── Stage 5: clean close with code 1000, awaiting the real close event ──
+    if (socket.readyState !== 3) socket.close(1000, 'qa-complete');
+    const closeGraceMs = Math.min(DEFAULT_CLOSE_GRACE_MS, timeoutMs);
+    await Promise.race([
+      waitFor('socket closure', () => null, true),
+      new Promise((_, reject) => {
+        graceTimer = setTimeout(() => reject(new Error(`Gemini Live socket close was not acknowledged within ${closeGraceMs}ms`)), closeGraceMs);
+      }),
+      deadline,
+    ]);
+
     return { ok: true, baseUrl: parsedBase.origin, model, choice: body.choice || modelChoice, ...accepted };
   } catch (error) {
     throw cleanError(error, secrets);
   } finally {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
+    if (graceTimer) clearTimeout(graceTimer);
+    controller.abort();
     try {
       if (socket && socket.readyState !== 3) socket.close(1000, 'qa-cleanup');
     } catch {}
@@ -161,9 +242,9 @@ async function runCli() {
       send() {
         sent += 1;
         if (sent === 1) queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ setupComplete: {} }) }));
-        if (sent === 2) queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AA==' } }] }, turnComplete: true } }) }));
+        if (sent === 2) queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AA==' } }] }, turnComplete: true } }) })); // eslint-disable-line no-unused-vars
       }
-      close(code = 1000, reason = '') { this.readyState = 3; this.onclose?.({ code, reason }); }
+      close(code = 1000, reason = '') { this.readyState = 3; this.onclose?.({ code, reason, wasClean: true }); }
     }
     options.fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ token: 'mock-token', model: 'gemini-2.5-flash-native-audio-preview-12-2025', choice: options.modelChoice, provider: 'gemini' }) });
     options.WebSocketClass = MockSocket;

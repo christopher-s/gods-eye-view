@@ -425,6 +425,7 @@ async function runBehaviorLayer() {
       select(model, 'gemini-3');
       const geminiPending = commands?.getDiagnostics?.().pendingVoiceSelection;
       select(model, 'gemini-2.5');
+      const finalPending = commands?.getDiagnostics?.().pendingVoiceSelection;
       return {
         hasRunner: typeof commands?.runner === 'function',
         hasDiagnostics: typeof commands?.getDiagnostics === 'function',
@@ -434,8 +435,15 @@ async function runBehaviorLayer() {
         initialPending: initial?.pendingVoiceSelection,
         openAiPending,
         geminiPending,
+        finalPending,
       };
     });
+    report(
+      selectionSurface.initialPending?.provider === 'gemini'
+        && selectionSurface.initialPending?.choice === 'gemini-2.5',
+      'behavior: pending voice selection defaults to Gemini 2.5 before any change',
+      `initialPending=${JSON.stringify(selectionSurface.initialPending)}`,
+    );
     report(
       selectionSurface.hasRunner
         && selectionSurface.hasDiagnostics
@@ -465,6 +473,12 @@ async function runBehaviorLayer() {
         && selectionSurface.geminiPending?.choice === 'gemini-3',
       'behavior: Gemini provider/model controls route independently',
       `models=${JSON.stringify(selectionSurface.geminiModels)} pending=${JSON.stringify(selectionSurface.geminiPending)}`,
+    );
+    report(
+      selectionSurface.finalPending?.provider === 'gemini'
+        && selectionSurface.finalPending?.choice === 'gemini-2.5',
+      'behavior: final pending selection resets to Gemini 2.5',
+      `finalPending=${JSON.stringify(selectionSurface.finalPending)}`,
     );
 
     // House rule: the intro flight clobbers teleports issued mid-flight.
