@@ -123,14 +123,20 @@ function createAudioContextFake({ sampleRate = 48000 } = {}) {
         context.modules.push(url);
       },
     },
-    createBuffer({ numberOfChannels, length, sampleRate: rate }) {
+    // Accepts both Web Audio overloads: positional (numberOfChannels,
+    // length, sampleRate) and the AudioBufferOptions dictionary.
+    createBuffer(numberOfChannels, length, sampleRate) {
+      const options =
+        typeof numberOfChannels === 'number'
+          ? { numberOfChannels, length, sampleRate }
+          : numberOfChannels;
       return {
-        numberOfChannels,
-        length,
-        sampleRate: rate,
+        numberOfChannels: options.numberOfChannels,
+        length: options.length,
+        sampleRate: options.sampleRate,
         channels: Array.from(
-          { length: numberOfChannels },
-          () => new Float32Array(length),
+          { length: options.numberOfChannels },
+          () => new Float32Array(options.length),
         ),
         getChannelData(index) {
           return this.channels[index];

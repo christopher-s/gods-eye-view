@@ -222,17 +222,55 @@ class FakeBufferSource {
   }
 }
 
-function createFakeContext({ currentTime = 0, sampleRate = 48000 } = {}) {
+/**
+ * Fake context whose createBuffer honours a subset of the two Web Audio
+ * overloads, mirroring real host divergence: Chrome 153 rejects the
+ * AudioBufferOptions dictionary form; hypothetical dictionary-only hosts
+ * reject the positional form.
+ *
+ * @param {object} [options]
+ * @param {number} [options.currentTime=0]
+ * @param {number} [options.sampleRate=48000]
+ * @param {Array<'positional'|'object'>} [options.createBufferForms] overloads to accept
+ */
+function createFakeContext({
+  currentTime = 0,
+  sampleRate = 48000,
+  createBufferForms = ['positional', 'object'],
+} = {}) {
   const state = { currentTime };
   const createdBuffers = [];
+  const createBufferCalls = [];
   const context = {
     sampleRate,
     get currentTime() {
       return state.currentTime;
     },
     destination: { toString: () => 'destination' },
-    createBuffer(options) {
-      const buffer = new FakeAudioBuffer(options);
+    createBuffer(numberOfChannels, length, bufferSampleRate) {
+      if (arguments.length === 1) {
+        if (!createBufferForms.includes('object')) {
+          // Chrome 153 rejects the dictionary overload verbatim.
+          throw new TypeError(
+            "Failed to execute 'createBuffer' on 'BaseAudioContext': 3 arguments required, but only 1 present.",
+          );
+        }
+        createBufferCalls.push('object');
+        const buffer = new FakeAudioBuffer(numberOfChannels);
+        createdBuffers.push(buffer);
+        return buffer;
+      }
+      if (!createBufferForms.includes('positional')) {
+        throw new TypeError(
+          "Failed to execute 'createBuffer' on 'BaseAudioContext': no overload matched the provided arguments.",
+        );
+      }
+      createBufferCalls.push('positional');
+      const buffer = new FakeAudioBuffer({
+        numberOfChannels,
+        length,
+        sampleRate: bufferSampleRate,
+      });
       createdBuffers.push(buffer);
       return buffer;
     },
@@ -265,6 +303,7 @@ function createFakeContext({ currentTime = 0, sampleRate = 48000 } = {}) {
   };
   context.__state = state;
   context.__createdBuffers = createdBuffers;
+  context.__createBufferCalls = createBufferCalls;
   return context;
 }
 
@@ -552,6 +591,62 @@ test('enqueueOutput never schedules in the past when the clock runs ahead', () =
   context.__state.currentTime = 11;
   session.enqueueOutput(pcm16ToBase64(new Int16Array(240)));
   assert.deepEqual(registry.all[1].startCalls, [11]);
+});
+
+test('enqueueOutput schedules playback on a context that rejects the createBuffer dictionary overload', () => {
+  // Chrome 153 accepts only the positional 3-argument createBuffer; the
+  // dictionary (options-object) form throws before any audio can be
+  // scheduled, silently zeroing Gemini playback.
+  const context = createFakeContext({
+    sampleRate: 48000,
+    currentTime: 4,
+    createBufferForms: ['positional'],
+  });
+  const registry = { all: [], starts: [] };
+  const session = new GeminiPcmAudioSession({
+    audioContext: context,
+    createBufferSource: () => new FakeBufferSource(registry),
+  });
+
+  session.enqueueOutput(pcm16ToBase64(Int16Array.from({ length: 240 }, (_, i) => i)));
+
+  assert.equal(registry.all.length, 1);
+  const source = registry.all[0];
+  assert.deepEqual(source.startCalls, [4]);
+  assert.equal(source.buffer.numberOfChannels, 1);
+  assert.equal(source.buffer.length, 240);
+  assert.equal(source.buffer.sampleRate, GEMINI_OUTPUT_SAMPLE_RATE);
+  assert.equal(source.buffer.getChannelData(0)[1], 1 / 32768);
+  // The positional overload was used, never the rejected dictionary form.
+  assert.deepEqual(context.__createBufferCalls, ['positional']);
+});
+
+test('enqueueOutput falls back to the createBuffer dictionary overload when positional throws', () => {
+  // Hypothetical dictionary-only hosts: the positional form throws and the
+  // dictionary form must still produce scheduled playback.
+  const context = createFakeContext({
+    sampleRate: 48000,
+    currentTime: 0,
+    createBufferForms: ['object'],
+  });
+  const registry = { all: [], starts: [] };
+  const session = new GeminiPcmAudioSession({
+    audioContext: context,
+    createBufferSource: () => new FakeBufferSource(registry),
+  });
+
+  session.enqueueOutput(pcm16ToBase64(Int16Array.from({ length: 120 }, (_, i) => -i)));
+
+  assert.equal(registry.all.length, 1);
+  const source = registry.all[0];
+  assert.deepEqual(source.startCalls, [0]);
+  assert.equal(source.buffer.numberOfChannels, 1);
+  assert.equal(source.buffer.length, 120);
+  assert.equal(source.buffer.sampleRate, GEMINI_OUTPUT_SAMPLE_RATE);
+  assert.equal(source.buffer.getChannelData(0)[1], -1 / 32768);
+  // Positional was attempted first, then the dictionary fallback succeeded.
+  assert.deepEqual(context.__createBufferCalls, ['object']);
+  assert.equal(context.__createdBuffers.length, 1);
 });
 
 test('enqueueOutput ignores empty, malformed, and non-string chunks', () => {

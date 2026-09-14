@@ -187,6 +187,37 @@ function defaultCreateWorkletNode(audioContext) {
 }
 
 /**
+ * Create a mono AudioBuffer for raw PCM playback.
+ *
+ * Web Audio defines two createBuffer overloads and hosts disagree on their
+ * availability: Chrome 153 rejects the AudioBufferOptions dictionary form
+ * ("3 arguments required, but only 1 present") while other hosts may only
+ * implement the dictionary. The positional form is the universally shipped
+ * legacy overload and has no mono-PCM disadvantage, so it is tried first
+ * with a dictionary fallback to keep every host scheduling audio.
+ *
+ * @param {BaseAudioContext} audioContext context owning the buffer
+ * @param {number} length frame count
+ * @param {number} sampleRate buffer sample rate in Hz
+ * @returns {AudioBuffer}
+ */
+export function createPcmBuffer(audioContext, length, sampleRate) {
+  try {
+    return audioContext.createBuffer(1, length, sampleRate);
+  } catch (positionalError) {
+    try {
+      return audioContext.createBuffer({
+        numberOfChannels: 1,
+        length,
+        sampleRate,
+      });
+    } catch {
+      throw positionalError;
+    }
+  }
+}
+
+/**
  * Owns Gemini Live capture and playback audio resources for one session.
  *
  * All Web Audio dependencies are injectable so scheduling is testable under
@@ -295,11 +326,11 @@ export class GeminiPcmAudioSession {
     if (!pcm.length) return;
 
     const audioContext = this.#audioContext;
-    const buffer = audioContext.createBuffer({
-      numberOfChannels: 1,
-      length: pcm.length,
-      sampleRate: GEMINI_OUTPUT_SAMPLE_RATE,
-    });
+    const buffer = createPcmBuffer(
+      audioContext,
+      pcm.length,
+      GEMINI_OUTPUT_SAMPLE_RATE,
+    );
     const channel = buffer.getChannelData(0);
     for (let i = 0; i < pcm.length; i += 1) {
       channel[i] = pcm[i] / 32768;
