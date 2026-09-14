@@ -3996,6 +3996,8 @@ test('C1: a post-barge-in tool-only turn still executes', async (t) => {
 
   // Barge-in marks a pending user turn (the user is speaking again)...
   socket.message({ serverContent: { interrupted: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(f.controller.userTurnPending, true);
 
   // ...and the server's response to that interruption is tool-only.

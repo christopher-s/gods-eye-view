@@ -492,3 +492,73 @@ test('smoke failures redact the minted token', async () => {
     (error) => !error.message.includes(token) && error.message.includes('[REDACTED]'),
   );
 });
+
+// ─────────────────────────────────────────────────────────────
+// Binary server frames (Gemini Live sends JSON as BINARY WS frames)
+// ─────────────────────────────────────────────────────────────
+
+/** Deterministic socket whose two scripted frames use a chosen wire encoding. */
+function binaryHappySocket(encode) {
+  return class BinaryHappySocket {
+    static OPEN = 1;
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.sentFrames = [];
+      queueMicrotask(() => { this.readyState = 1; this.onopen?.(); });
+    }
+    send(frame) {
+      this.sentFrames.push(JSON.parse(frame));
+      const count = this.sentFrames.length;
+      const deliver = (payload) =>
+        this.onmessage?.({ data: encode(JSON.stringify(payload)) });
+      if (count === 1) queueMicrotask(() => deliver({ setupComplete: {} }));
+      if (count === 2) queueMicrotask(() => deliver({
+        serverContent: {
+          modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AA==' } }] },
+          turnComplete: true,
+        },
+      }));
+    }
+    close(code = 1000, reason = '') {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      queueMicrotask(() => this.onclose?.({ code, reason, wasClean: true }));
+    }
+  };
+}
+
+test('smoke completes when server frames arrive as ArrayBuffer', async () => {
+  const result = await createGeminiLiveSmoke({
+    baseUrl: 'http://127.0.0.1:4173',
+    timeoutMs: 2000,
+    fetchImpl: tokenFetch(),
+    WebSocketClass: binaryHappySocket((text) =>
+      new TextEncoder().encode(text).buffer,
+    ),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.audio, true);
+});
+
+test('smoke completes when server frames arrive as Blob', async () => {
+  const result = await createGeminiLiveSmoke({
+    baseUrl: 'http://127.0.0.1:4173',
+    timeoutMs: 2000,
+    fetchImpl: tokenFetch(),
+    WebSocketClass: binaryHappySocket((text) => new Blob([text])),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.audio, true);
+});
+
+test('smoke still completes when server frames arrive as strings', async () => {
+  const result = await createGeminiLiveSmoke({
+    baseUrl: 'http://127.0.0.1:4173',
+    timeoutMs: 2000,
+    fetchImpl: tokenFetch(),
+    WebSocketClass: binaryHappySocket((text) => text),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.audio, true);
+});

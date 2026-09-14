@@ -82,6 +82,24 @@ class FakeWebSocket {
     this.onmessage?.({ data: text });
   }
 
+  // Gemini Live server frames arrive as BINARY WebSocket frames; these
+  // drivers deliver the same JSON through every wire encoding the transport
+  // must tolerate. `binaryType` stays unset on the fake until the transport
+  // opts into 'arraybuffer', mirroring a fresh browser socket.
+  arrayBufferMessage(payload) {
+    this.rawMessageData(
+      new TextEncoder().encode(JSON.stringify(payload)).buffer,
+    );
+  }
+
+  blobMessage(payload) {
+    this.rawMessageData(new Blob([JSON.stringify(payload)]));
+  }
+
+  rawMessageData(data) {
+    this.onmessage?.({ data });
+  }
+
   fail(error = new Error('socket error')) {
     this.onerror?.(error);
   }
@@ -564,6 +582,7 @@ test('modelTurn inlineData audio is enqueued for playback and reports activity o
       },
     },
   });
+  await flush();
 
   assert.deepEqual(session.enqueued, [AUDIO_CHUNK, AUDIO_CHUNK]);
   assert.deepEqual(f.callbacks.assistantAudio, [AUDIO_CHUNK, AUDIO_CHUNK]);
@@ -610,6 +629,7 @@ test('audio arriving on a suspended context lazily resumes it and still schedule
   socket.message({
     serverContent: { modelTurn: { parts: [{ inlineData: { data: AUDIO_CHUNK } }] } },
   });
+  await flush();
 
   assert.equal(resumeCalls, 1, 'audio on a suspended context triggered resume');
   assert.deepEqual(
@@ -675,6 +695,7 @@ test('a completing client text turn resets an older assistant turn before tool-o
       modelTurn: { parts: [{ inlineData: { data: AUDIO_CHUNK } }] },
     },
   });
+  await flush();
   assert.equal(f.callbacks.assistantTurnStarts, 1, 'old turn started');
 
   f.transport.sendText('fly to Tokyo');
@@ -697,6 +718,7 @@ test('a text-only modelTurn part reports its turn start', async () => {
       modelTurn: { parts: [{ text: 'Tokyo, on it.' }] },
     },
   });
+  await flush();
 
   assert.equal(f.callbacks.assistantTurnStarts, 1);
   assert.deepEqual(
@@ -711,12 +733,14 @@ test('turnComplete closes the assistant turn and a later modelTurn reopens one',
   const socket = await f.connect();
 
   socket.message({ serverContent: { turnComplete: true } });
+  await flush();
   assert.equal(f.callbacks.turnCompletes, 1);
   socket.message({
     serverContent: {
       modelTurn: { parts: [{ inlineData: { data: AUDIO_CHUNK } }] },
     },
   });
+  await flush();
   assert.equal(f.callbacks.assistantTurnStarts, 1);
 });
 
@@ -726,6 +750,7 @@ test('interrupted clears queued playback and reports the interruption', async ()
   const session = f.sessions.at(-1);
 
   socket.message({ serverContent: { interrupted: true } });
+  await flush();
 
   assert.equal(session.cleared, 1);
   assert.equal(f.callbacks.interrupted, 1);
@@ -744,6 +769,7 @@ test('usageMetadata is surfaced through onUsage untouched', async () => {
     usageMetadata: usage,
     serverContent: { turnComplete: true },
   });
+  await flush();
 
   assert.deepEqual(f.callbacks.usage, [usage]);
 });
@@ -756,9 +782,123 @@ test('malformed server messages are ignored without throwing', async () => {
   socket.rawMessage('null');
   socket.rawMessage('"just a string"');
   socket.message({ serverContent: { modelTurn: { parts: 'nope' } } });
+  await flush();
 
   assert.equal(f.callbacks.errors.length, 0);
   assert.equal(f.callbacks.assistantTurnStarts, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Binary WebSocket frames (the encoding Gemini Live actually uses)
+// ---------------------------------------------------------------------------
+
+test('the socket opts into arraybuffer binary frames on connect', async () => {
+  const f = createHarness();
+  const socket = await f.connect();
+
+  assert.equal(
+    socket.binaryType,
+    'arraybuffer',
+    'binaryType must be set before any server frame can arrive',
+  );
+});
+
+test('server frames delivered as ArrayBuffer are decoded and dispatched', async () => {
+  const f = createHarness();
+  const socket = await f.connect();
+  const session = f.sessions.at(-1);
+
+  socket.arrayBufferMessage({
+    serverContent: {
+      modelTurn: {
+        parts: [
+          { inlineData: { data: AUDIO_CHUNK, mimeType: 'audio/pcm;rate=24000' } },
+        ],
+      },
+    },
+  });
+  socket.arrayBufferMessage({ serverContent: { turnComplete: true } });
+  await flush();
+
+  assert.deepEqual(f.callbacks.assistantAudio, [AUDIO_CHUNK]);
+  assert.deepEqual(session.enqueued, [AUDIO_CHUNK]);
+  assert.equal(f.callbacks.assistantTurnStarts, 1);
+  assert.equal(f.callbacks.turnCompletes, 1);
+  assert.equal(
+    f.callbacks.logs.filter((entry) => entry.event === 'gemini.server.malformed_message')
+      .length,
+    0,
+    'binary frames must not fall into the malformed-message catch',
+  );
+});
+
+test('server frames delivered as Blob are decoded and dispatched', async () => {
+  const f = createHarness();
+  const socket = await f.connect();
+  const session = f.sessions.at(-1);
+
+  socket.blobMessage({
+    serverContent: {
+      modelTurn: {
+        parts: [
+          { inlineData: { data: AUDIO_CHUNK, mimeType: 'audio/pcm;rate=24000' } },
+        ],
+      },
+    },
+  });
+  socket.blobMessage({ serverContent: { turnComplete: true } });
+  await flush();
+
+  assert.deepEqual(f.callbacks.assistantAudio, [AUDIO_CHUNK]);
+  assert.deepEqual(session.enqueued, [AUDIO_CHUNK]);
+  assert.equal(f.callbacks.assistantTurnStarts, 1);
+  assert.equal(f.callbacks.turnCompletes, 1);
+  assert.equal(
+    f.callbacks.logs.filter((entry) => entry.event === 'gemini.server.malformed_message')
+      .length,
+    0,
+  );
+});
+
+test('string frames keep working and ordering survives interleaved encodings', async () => {
+  const f = createHarness();
+  const socket = await f.connect();
+
+  // Interleave: audio (string), audio (ArrayBuffer), turnComplete (Blob).
+  socket.message({
+    serverContent: {
+      modelTurn: {
+        parts: [
+          { inlineData: { data: `${AUDIO_CHUNK}S`, mimeType: 'audio/pcm;rate=24000' } },
+        ],
+      },
+    },
+  });
+  socket.arrayBufferMessage({
+    serverContent: {
+      modelTurn: {
+        parts: [
+          { inlineData: { data: `${AUDIO_CHUNK}A`, mimeType: 'audio/pcm;rate=24000' } },
+        ],
+      },
+    },
+  });
+  socket.blobMessage({ serverContent: { turnComplete: true } });
+  await flush(8);
+
+  // One continuous assistant turn: two audio parts, one completion, in order.
+  assert.deepEqual(f.callbacks.assistantAudio, [
+    `${AUDIO_CHUNK}S`,
+    `${AUDIO_CHUNK}A`,
+  ]);
+  assert.equal(f.callbacks.assistantTurnStarts, 1);
+  assert.equal(f.callbacks.turnCompletes, 1);
+  // The string frame was dispatched synchronously first; the binary frames
+  // followed in arrival order after their (microtask) decode settled.
+  const audioLog = f.callbacks.logs.filter(
+    (entry) => entry.event === 'gemini.server.event',
+  );
+  assert.equal(audioLog.length, 3, 'all three frames were parsed as events');
 });
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1409,7 @@ test('goAway is treated as a fatal session-expiry error', async () => {
   const socket = await f.connect();
 
   socket.message({ goAway: { reason: 'quota' } });
+  await flush();
 
   assert.equal(f.callbacks.errors.length, 1);
   assert.equal(f.callbacks.errors[0].info.fatal, true);
@@ -1280,6 +1421,7 @@ test('a server error message is fatal and sanitized', async () => {
   const socket = await f.connect();
 
   socket.message({ error: { code: 400, message: 'invalid setup payload' } });
+  await flush();
 
   assert.equal(f.callbacks.errors.length, 1);
   assert.equal(f.callbacks.errors[0].info.fatal, true);

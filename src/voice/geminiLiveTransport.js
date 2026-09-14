@@ -34,6 +34,29 @@ const GEMINI_INPUT_MIME_TYPE = 'audio/pcm;rate=16000';
 const GEMINI_CALL_DEDUPE_MS = 2500;
 const GEMINI_CALL_DEDUPE_MEMORY_MAX = 64;
 
+// Decoding BINARY frames (the only encoding the Gemini Live server uses).
+const FRAME_TEXT_DECODER = new TextDecoder();
+
+/**
+ * Normalize one WebSocket frame body to JSON text.
+ *
+ * Gemini Live sends every server message as a BINARY frame. Browsers surface
+ * those as Blobs, or as ArrayBuffers once the socket opts into
+ * binaryType='arraybuffer'; Node's ws surfaces strings. All three encodings
+ * carry the same JSON. Unsupported bodies throw so the caller logs a
+ * malformed message instead of silently dropping it.
+ */
+async function decodeFrameText(data) {
+  if (typeof data === 'string') return data;
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+    return FRAME_TEXT_DECODER.decode(data);
+  }
+  if (data && typeof data.text === 'function') {
+    return data.text();
+  }
+  throw new Error('Unsupported WebSocket frame encoding');
+}
+
 function defaultFetch() {
   if (typeof fetch !== 'function') {
     throw new Error('Gemini Live requires fetch support');
@@ -254,6 +277,9 @@ export class GeminiLiveTransport {
   #activeToolControllers = new Set();
   #openSettled = null;
   #earlyFatalError = null;
+  // Frames are handled asynchronously (Blob.text() cannot be avoided in the
+  // general case); this chain keeps dispatch in arrival order.
+  #messageQueue = Promise.resolve();
 
   constructor(options = {}) {
     if (typeof options.runner !== 'function') {
@@ -421,6 +447,10 @@ export class GeminiLiveTransport {
       `${GEMINI_LIVE_WEBSOCKET_ENDPOINT}?access_token=${encodeURIComponent(token)}`,
     );
     this.#socket = socket;
+    // Binary frames surface as ArrayBuffer (synchronous TextDecoder decode)
+    // instead of Blob; Blob/string bodies are still tolerated in #handleMessage
+    // so an unexpected runtime or test double cannot drop frames.
+    socket.binaryType = 'arraybuffer';
     let settled = false;
     this.#openSettled = Promise.withResolvers();
     const settleOpen = (resolution) => {
@@ -455,7 +485,14 @@ export class GeminiLiveTransport {
       }
       this.#handleUnexpectedClose(event);
     };
-    socket.onmessage = (event) => this.#handleMessage(event);
+    socket.onmessage = (event) => {
+      // Chain each frame through the queue so decoding (async for Blobs) can
+      // never reorder server messages. Rejections are already contained
+      // inside #handleMessage; the catch is a last-resort guard.
+      this.#messageQueue = this.#messageQueue
+        .then(() => this.#handleMessage(event))
+        .catch(() => {});
+    };
   }
 
   #sendJson(message) {
@@ -543,7 +580,7 @@ export class GeminiLiveTransport {
     return this.#sendJson({ toolResponse: { functionResponses } });
   }
 
-  #handleMessage(event) {
+  async #handleMessage(event) {
     // The server can speak before start() has promoted the session to 'open'
     // (e.g. a setup rejection racing our own audio wiring). Messages in that
     // window are accepted once the socket itself is open — dropping them
@@ -552,7 +589,7 @@ export class GeminiLiveTransport {
     if (!this.#isOpen() && !socketOpen) return;
     let payload = null;
     try {
-      payload = JSON.parse(event?.data);
+      payload = JSON.parse(await decodeFrameText(event?.data));
     } catch {
       this.#log('gemini.server.malformed_message');
       return;

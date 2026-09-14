@@ -50,9 +50,16 @@ export function protocolAcceptance(messages) {
   return { ok: setupComplete && (audio || validModelResponse), setupComplete, audio, validModelResponse };
 }
 
-function parseMessage(raw) {
+async function parseMessage(raw) {
   try {
-    return JSON.parse(typeof raw === 'string' ? raw : raw.toString());
+    // Gemini Live delivers server JSON in BINARY frames: Blob in browsers,
+    // ArrayBuffer once binaryType='arraybuffer', or string (Node ws).
+    if (typeof raw === 'string') return JSON.parse(raw);
+    if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
+      return JSON.parse(new TextDecoder().decode(raw));
+    }
+    if (raw && typeof raw.text === 'function') return JSON.parse(await raw.text());
+    return null;
   } catch {
     return null;
   }
@@ -160,10 +167,12 @@ export async function createGeminiLiveSmoke({
     ]);
 
     socketOn(socket, 'message', (event) => {
-      const message = parseMessage(event?.data ?? event);
-      if (!message) return;
-      messages.push(message);
-      pump();
+      // Async parse (Blob.text()); pumping happens after the message lands.
+      void parseMessage(event?.data ?? event).then((message) => {
+        if (!message) return;
+        messages.push(message);
+        pump();
+      });
     });
     socketOn(socket, 'error', (error) => {
       fatal = fatal || (error instanceof Error ? error : new Error('Gemini Live WebSocket error'));
