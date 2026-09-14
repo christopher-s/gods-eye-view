@@ -8068,9 +8068,18 @@ body:not(.ui-clean-view):not(.recording-mode) #cesium-credits {
   gap: 0.3rem 0.45rem;
   width: min(22rem, 80vw);
   padding: 0.55rem;
+  visibility: hidden;
+  opacity: 0;
   background: rgba(4, 12, 20, 0.96);
   border: 1px solid rgba(0, 212, 255, 0.42);
   box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  transform: translateY(0.65rem) scale(0.985);
+  transform-origin: bottom left;
+  transition:
+    opacity 160ms ease,
+    visibility 160ms ease,
+    transform 210ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 #command-dock .gev-voice-selection label {
@@ -8938,6 +8947,18 @@ body:not(.ui-clean-view):not(.recording-mode):has(#intel-hud[data-variant='minim
   visibility: visible;
   opacity: 1;
   transform: translate(-50%, 0) scale(1);
+}
+
+/* The selection tray precedes #gev-voice-button in the DOM, so the mic-button
+   focus reveal needs :has() instead of the sibling combinator; :focus-within
+   keeps the tray open while tabbing through the provider/model selects. */
+#command-dock #gev-voice-control:not([data-status='error']):hover .gev-voice-selection,
+#command-dock #gev-voice-control:not([data-status='error']):has(#gev-voice-button:focus-visible) .gev-voice-selection,
+#command-dock .gev-voice-selection:focus-within {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
 }
 
 #command-dock.dock-has-pinned-tray .gev-voice-help-tray {

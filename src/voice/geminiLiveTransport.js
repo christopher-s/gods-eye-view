@@ -362,6 +362,7 @@ export class GeminiLiveTransport {
       const audioContext = this.#createAudioContextChecked();
       this.#audioContext = audioContext;
       this.#options.onAudioContext(audioContext);
+      this.#resumeAudioContext();
       if (typeof audioContext.audioWorklet?.addModule !== 'function') {
         throw new Error(
           'Gemini Live requires audioWorklet support to capture microphone PCM',
@@ -397,6 +398,21 @@ export class GeminiLiveTransport {
       throw new Error('Gemini Live requires a functional AudioContext');
     }
     return context;
+  }
+
+  /**
+   * Fire-and-forget autoplay resume. Chrome creates AudioContexts in a
+   * 'suspended' state until unlocked by a user gesture; start() runs from
+   * the mic-button click, but without an explicit resume() the scheduled
+   * playback sources stay silent. Resumed defensively at start() and again
+   * lazily before scheduling audio; failures are non-fatal because
+   * scheduling into a still-suspended context is safe and the promise is
+   * never awaited.
+   */
+  #resumeAudioContext() {
+    const context = this.#audioContext;
+    if (!context || context.state === 'running') return;
+    Promise.resolve(context.resume?.()).catch(() => {});
   }
 
   #openSocket(token) {
@@ -575,6 +591,7 @@ export class GeminiLiveTransport {
         for (const part of parts) {
           const data = part?.inlineData?.data;
           if (typeof data !== 'string' || !data) continue;
+          this.#resumeAudioContext();
           this.#session?.enqueueOutput?.(data);
           this.#options.onAssistantAudio(data);
         }

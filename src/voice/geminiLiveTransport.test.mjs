@@ -574,6 +574,75 @@ test('modelTurn inlineData audio is enqueued for playback and reports activity o
   );
 });
 
+// ---------------------------------------------------------------------------
+// AudioContext autoplay resume (Chrome autoplay policy)
+// ---------------------------------------------------------------------------
+
+test('start() resumes an autoplay-suspended AudioContext once created', async () => {
+  const context = createAudioContextFake();
+  context.state = 'suspended';
+  let resumeCalls = 0;
+  context.resume = async () => {
+    resumeCalls += 1;
+    context.state = 'running';
+  };
+  const f = createHarness({ createAudioContext: () => context });
+
+  await f.connect();
+
+  assert.equal(resumeCalls, 1, 'start() resumed the suspended context');
+});
+
+test('audio arriving on a suspended context lazily resumes it and still schedules playback', async () => {
+  const context = createAudioContextFake();
+  context.state = 'running';
+  let resumeCalls = 0;
+  context.resume = () => {
+    resumeCalls += 1;
+    // Never settles: scheduling must not wait for the resume.
+    return new Promise(() => {});
+  };
+  const f = createHarness({ createAudioContext: () => context });
+  const socket = await f.connect();
+  const session = f.sessions.at(-1);
+  context.state = 'suspended';
+
+  socket.message({
+    serverContent: { modelTurn: { parts: [{ inlineData: { data: AUDIO_CHUNK } }] } },
+  });
+
+  assert.equal(resumeCalls, 1, 'audio on a suspended context triggered resume');
+  assert.deepEqual(
+    session.enqueued,
+    [AUDIO_CHUNK],
+    'scheduling does not wait for resume to settle',
+  );
+});
+
+test('a resume() rejection never breaks playback scheduling or the session', async () => {
+  const context = createAudioContextFake();
+  context.state = 'running';
+  let resumeCalls = 0;
+  context.resume = () => {
+    resumeCalls += 1;
+    return Promise.reject(new Error('autoplay policy denied resume'));
+  };
+  const f = createHarness({ createAudioContext: () => context });
+  const socket = await f.connect();
+  const session = f.sessions.at(-1);
+  context.state = 'suspended';
+
+  socket.message({
+    serverContent: { modelTurn: { parts: [{ inlineData: { data: AUDIO_CHUNK } }] } },
+  });
+  await flush();
+
+  assert.equal(resumeCalls, 1, 'resume was attempted');
+  assert.deepEqual(session.enqueued, [AUDIO_CHUNK], 'chunk still scheduled');
+  assert.equal(f.callbacks.errors.length, 0, 'rejection not surfaced as an error');
+  assert.equal(f.transport.readyState, 'open', 'session still open');
+});
+
 test('a tool-only turn (no audio part) reports its turn start', async () => {
   const f = createHarness({
     runner: async () => ({ ok: true }),
